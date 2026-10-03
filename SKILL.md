@@ -5,6 +5,23 @@ description: "文件管理器 + 系统监控 + AI Agent 网页终端（TypeScrip
 
 # File Manager + Monitor
 
+## Source Repository
+
+本 skill 的完整源码仓库是：
+
+`https://github.com/caichengle666/muse-file-manager-monitor`
+
+第一次复刻时，如果当前工作区还没有 `app/` 目录，先拉取仓库：
+
+```bash
+git clone https://github.com/caichengle666/muse-file-manager-monitor.git
+cd muse-file-manager-monitor
+```
+
+然后把仓库中的 `app/` 作为构件源码输入。复刻时必须复制 `app/client/`、`app/server/`、`app/drizzle/`、`app/space.json`、`app/bunfig.toml` 和 `app/tsconfig.base.json`；不要复制 `preview.html`，它只是本地静态预览文件，不属于构件运行时。
+
+如果已经在一个现有 skill 或构件目录中工作，先读取仓库最新的 `SKILL.md`、`references/architecture.md` 和 `app/` 源码，再开始重建，不要根据记忆重新猜测文件内容。
+
 ## Purpose
 
 三层全栈应用：**文件页**（系统 / 工作区 / 构件 / 私有四种浏览模式，可编辑保存，图片可预览）+ **监控页**（CPU / 内存 / 磁盘 / 网络 / 进程，1 秒轮询画曲线，挂载点独立容量、每核 CPU、网卡拆分、目录占用排行、重启记录）+ **终端页签**（网页 Shell + 外部 OpenAI-compatible API 驱动的多步 AI Agent）。`app/` 是完整源码快照，`references/architecture.md` 是架构说明。

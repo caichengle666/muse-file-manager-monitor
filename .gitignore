@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.space-build/
+.harness/
+audits/
+.bun-cache/
+*.tsbuildinfo
+preview.html
+app.db

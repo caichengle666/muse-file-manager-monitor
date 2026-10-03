@@ -17,6 +17,10 @@
 **终端页签与 AI Agent**：网页里执行 shell 命令（单次 30 秒超时）；可配置外部 OpenAI-compatible API、拉取模型，并让 AI 按“生成命令 → 执行 → 读取 stdout/stderr → 继续下一步”的循环完成最多 20 步任务。读取类命令自动执行，修改/删除/移动/安装/权限变更命令暂停等待用户确认。RCE 级能力，只用于完全控制的私有部署。
 
 **关键设计决定**
+- 命令权限从正则黑名单改成白名单分类（`server/src/commandPolicy.ts`）：只有明确只读/测试命令自动执行，`sudo`、`bash -c`、`find -delete`、重定向、管道到 shell 等都会落入需确认，消除了旧实现的大量绕过面
+- 修改/删除确认由服务端一次性 `confirmToken` 把关（SHA-256 存储、5 分钟过期、命令内容必须匹配、用后即焚），不再信任客户端布尔标志
+- AI Agent 任务有 30 分钟 TTL、单任务并发锁、100 个任务上限和消息总量上限；模型请求有 60 秒超时，模型地址拒绝私网/本机/重定向（SSRF 防护），模型输出解析容忍代码块和前后解释文字
+- 文件写/删/移在操作前拒绝符号链接叶子并重新解析父目录真实路径，降低 TOCTOU/符号链接风险；终端面板改为固定高度，输出区可靠内滚
 - 私有存储从 SQLite 虚拟文件系统改为真实目录映射；旧虚拟 FS 的 10 个 action 及独占代码已彻底移除，仅保留一次性的 `migratePrivateWorkspace`
 - drizzle migration 包含 `service_restart_record.sql`、`workspace_items.sql` 和 `ai_provider_config.sql`，全部 `IF NOT EXISTS` 幂等
 - 系统启动时间读 `/proc/stat` 的 btime 并进程内缓存，不随采样漂移

@@ -1,21 +1,21 @@
 import {
-accessSync,
-closeSync,
-constants,
-existsSync,
-lstatSync,
-mkdirSync,
-openSync,
-readFileSync,
-readdirSync,
-readSync,
-realpathSync,
-renameSync,
-rmSync,
-statfsSync,
-statSync,
-unlinkSync,
-writeFileSync,
+  accessSync,
+  closeSync,
+  constants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statfsSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { exec, execFile } from "node:child_process";
 import { cpus, homedir, hostname, loadavg, platform, release, uptime, userInfo } from "node:os";
@@ -399,6 +399,18 @@ function getDirectory(rootKind: HostRoot, raw: string, showSensitive: boolean) {
   try { return statSync(target.absolute).isDirectory() ? { ...target, root: selectedRoot } : null; } catch { return null; }
 }
 
+// TOCTOU hardening: re-check the real path and reject symlink leaves at the
+// moment of mutation. These helpers intentionally fail closed.
+function assertSafeMutationTarget(absolute: string): void {
+  if (lstatSync(absolute).isSymbolicLink()) throw new Error("refusing to mutate a symbolic link");
+}
+
+function assertSafeParent(absolute: string): string {
+  const parent = realpathSync(dirname(absolute));
+  if (!statSync(parent).isDirectory()) throw new Error("parent is not a directory");
+  return parent;
+}
+
 export const privilegedHandlers = definePrivilegedHandlers(privileged, {
   async listHostDirectory(args) {
     const selectedRoot = findRoot(args.root);
@@ -553,10 +565,11 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     try {
       const stats = statSync(target.absolute);
       if (!stats.isFile()) return { ok: false, message: "只能编辑文件。" };
+      assertSafeMutationTarget(target.absolute);
       const first = readSlice(target.absolute, 0, Math.min(64_000, Math.max(1, stats.size)));
       if (!isLikelyText(first, target.absolute)) return { ok: false, message: "二进制文件只能查看十六进制或下载，不能按文本保存。" };
       if (!canWrite(target.absolute)) return { ok: false, message: "当前运行用户没有这个文件的写入权限。" };
-      const parentDirectory = dirname(target.absolute);
+      const parentDirectory = assertSafeParent(target.absolute);
       if (!canWrite(parentDirectory)) return { ok: false, message: "为保护原文件，保存需要其所在目录可写；当前目录只读，未作任何更改。" };
       temporaryPath = join(parentDirectory, `.${basename(target.absolute)}.muse-${crypto.randomUUID()}.tmp`);
       writeFileSync(temporaryPath, args.content, { encoding: "utf8", mode: stats.mode, flag: "wx" });
@@ -575,7 +588,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     if (!directory || !name) return { ok: false, message: "目录或文件名无效。", path: null };
     const destination = join(directory.absolute, name);
     if (existsSync(destination)) return { ok: false, message: "同名项目已经存在。", path: null };
-    try { writeFileSync(destination, "", { encoding: "utf8", flag: "wx" }); return { ok: true, message: "文件已创建。", path: destination }; }
+    try { assertSafeParent(destination); writeFileSync(destination, "", { encoding: "utf8", flag: "wx" }); return { ok: true, message: "文件已创建。", path: destination }; }
     catch { return { ok: false, message: "创建失败，当前运行用户可能没有目录写入权限。", path: null }; }
   },
 
@@ -598,6 +611,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const quarantine = join(parent, `.${basename(source.absolute)}.muse-delete-${crypto.randomUUID()}`);
     let staged = false;
     try {
+      assertSafeMutationTarget(source.absolute);
       renameSync(source.absolute, quarantine);
       staged = true;
       rmSync(quarantine, { recursive: true, force: false });
@@ -623,6 +637,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const destination = join(targetDirectory.absolute, name);
     if (existsSync(destination)) return { ok: false, message: "目标位置已有同名项目。", path: null };
     try {
+      assertSafeMutationTarget(source.absolute);
       renameSync(source.absolute, destination);
       if (!existsSync(destination) || existsSync(source.absolute)) return { ok: false, message: "移动结果无法确认，请刷新源目录和目标目录后再操作。", path: null };
       return { ok: true, message: "项目已在磁盘上移动或重命名。", path: destination };
@@ -640,6 +655,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     try {
       const bytes = Buffer.from(args.dataBase64, "base64");
       if (bytes.byteLength > 12_000_000) return { ok: false, message: "单个上传文件不能超过 12 MB。", path: null };
+      assertSafeParent(destination);
       writeFileSync(destination, bytes, { flag: "wx" });
       return { ok: true, message: "文件已上传到磁盘目录。", path: destination };
     } catch { return { ok: false, message: "上传失败，当前运行用户可能没有目录写入权限。", path: null }; }
@@ -681,7 +697,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     }
     const started = Date.now();
     const marker = `__MUSE_CWD_${crypto.randomUUID()}__`;
-    const wrappedCommand = `trap 'printf "\\n${marker}%s\\n" "$PWD"' EXIT\n${args.command}`;
+    const wrappedCommand = `export TERM="\${TERM:-xterm-256color}"\ntrap 'printf "\\n${marker}%s\\n" "$PWD"' EXIT\n${args.command}`;
     return new Promise((resolvePromise) => {
       const onComplete = (error: Error | null, stdout: string | Buffer, stderr: string | Buffer) => {
         const candidate = error as (Error & { code?: number | string; killed?: boolean; signal?: string }) | null;
@@ -699,8 +715,9 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         }
         resolvePromise({ ok: !error, stdout: cleanStdout, stderr: timedOut ? `${String(stderr)}${stderr ? "\n" : ""}命令超过 30 秒，已终止。` : String(stderr), exitCode: code, timedOut, cwd: nextCwd, durationMs: Math.max(0, Date.now() - started) });
       };
-      const options = { cwd, timeout: 30000, maxBuffer: 1_000_000 };
+      const options = { cwd, timeout: 30000, maxBuffer: 1_000_000, env: { ...process.env, TERM: "xterm-256color" } };
       if (args.runAsRoot && typeof process.getuid === "function" && process.getuid() !== 0) execFile("sudo", ["-n", "/bin/bash", "-c", wrappedCommand], options, onComplete);
+      if (args.runAsRoot) console.warn(`[muse-audit] root shell uid=${process.getuid?.() ?? "?"} cwd=${cwd} command=${JSON.stringify(args.command.slice(0, 2000))}`);
       else exec(wrappedCommand, { ...options, shell: "/bin/bash" }, onComplete);
     });
   },

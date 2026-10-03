@@ -288,6 +288,7 @@ export function App() {
   }
 
   async function runTerminal(command: string, root: HostRoot, path: string) {
+    if (/^clear\s*;?\s*$/.test(command)) { setTerminalHistory([]); return; }
     setTerminalBusy(true);
     try {
       const contextKey = `${root}:${path}`;
@@ -469,10 +470,6 @@ function TerminalView({ entries, busy, onRun, onClear }: { entries: TerminalEntr
   const [command, setCommand] = useState("");
   const [root, setRoot] = useState<HostRoot>("workspace");
   const [path, setPath] = useState("");
-  const [aiPrompt, setAiPrompt] = useState("");
-  const [aiCommand, setAiCommand] = useState("");
-  const [aiExplanation, setAiExplanation] = useState("");
-  const [aiConfirm, setAiConfirm] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiBaseUrl, setAiBaseUrl] = useState("https://api.openai.com");
   const [aiApiKey, setAiApiKey] = useState("");
@@ -483,6 +480,7 @@ function TerminalView({ entries, busy, onRun, onClear }: { entries: TerminalEntr
   const [agentTaskId, setAgentTaskId] = useState<string | null>(null);
   const [agentStatus, setAgentStatus] = useState("");
   const [agentPending, setAgentPending] = useState("");
+  const [agentToken, setAgentToken] = useState<string | null>(null);
   const [agentSteps, setAgentSteps] = useState<Array<{ command: string; stdout: string; stderr: string }>>([]);
   const outputRef = useRef<HTMLDivElement>(null);
   useEffect(() => { outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight }); }, [entries, busy]);
@@ -490,13 +488,23 @@ function TerminalView({ entries, busy, onRun, onClear }: { entries: TerminalEntr
   function submit(event: FormEvent) { event.preventDefault(); const value = command.trim(); if (!value || busy) return; setCommand(""); void onRun(value, root, path); }
   async function saveAi() { if (!aiApiKey.trim() || !aiModel.trim()) return; setAiBusy(true); try { const result = await api.saveAiProviderConfig({ baseUrl: aiBaseUrl, apiKey: aiApiKey, model: aiModel }); setAiConfigured(result.ok); } finally { setAiBusy(false); } }
   async function pullModels() { if (!aiApiKey.trim()) return; setAiBusy(true); try { const result = await api.listAiModels({ baseUrl: aiBaseUrl, apiKey: aiApiKey }); setAiModels(result.models); } finally { setAiBusy(false); } }
-  async function generateAi() { if (!aiPrompt.trim()) return; setAiBusy(true); try { const result = await api.generateAiShellCommand({ prompt: aiPrompt, root, path }); setAiCommand(result.command); setAiExplanation(result.explanation); setAiConfirm(result.requiresConfirmation); } finally { setAiBusy(false); } }
-  async function runAiCommand() { const value = aiCommand.trim(); if (!value || (aiConfirm && !window.confirm("这条命令可能修改或删除沙盒内容，确认继续执行吗？"))) return; setAiCommand(""); await onRun(value, root, path); }
-  async function runAgent(approvePending = false) { if (!agentPrompt.trim() && !agentTaskId) return; setAiBusy(true); try { const result = await api.runAiTask({ taskId: agentTaskId, prompt: agentPrompt || "继续当前任务", root, path, approvePending, maxSteps: 20 }); setAgentTaskId(result.status === "completed" || result.status === "failed" ? null : result.taskId); setAgentStatus(result.message); setAgentPending(result.pendingCommand ?? ""); setAgentSteps(result.steps.map((step) => ({ command: step.command, stdout: step.stdout, stderr: step.stderr }))); if (result.status === "completed") setAgentPrompt(""); } finally { setAiBusy(false); } }
+  async function runAgent(confirmToken?: string) {
+    if (!agentPrompt.trim() && !agentTaskId) return;
+    setAiBusy(true);
+    try {
+      const result = await api.runAiTask({ taskId: agentTaskId, prompt: agentPrompt || "继续当前任务", root, path, confirmToken: confirmToken ?? null, maxSteps: 20 });
+      setAgentTaskId(result.status === "completed" || result.status === "failed" ? null : result.taskId);
+      setAgentStatus(result.message);
+      setAgentPending(result.pendingCommand ?? "");
+      setAgentToken(result.confirmToken ?? null);
+      setAgentSteps(result.steps.map((step) => ({ command: step.command, stdout: step.stdout, stderr: step.stderr })));
+      if (result.status === "completed") { setAgentPrompt(""); setAgentToken(null); }
+    } finally { setAiBusy(false); }
+  }
   return <section className="terminal-panel" aria-label="终端">
     <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 30 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
     <div className="terminal-location"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div>
-    <div className="ai-terminal-panel"><div className="ai-terminal-heading"><div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div><span>自动读取输出并继续 · 改删操作确认</span></div><div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="password" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={aiConfigured ? "API Key 已保存，重新输入可更新" : "API Key"} /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiApiKey.trim()}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiApiKey.trim() || !aiModel.trim()}>保存配置</button></div><div className="ai-terminal-prompt"><input value={agentPrompt} onChange={(event) => setAgentPrompt(event.target.value)} placeholder="描述一个完整任务，例如：检查项目错误并修复，然后运行测试" /><button type="button" onClick={() => void runAgent()} disabled={aiBusy || !agentPrompt.trim()}>运行任务</button></div>{agentStatus && <div className="agent-status">{agentStatus}</div>}{agentPending && <div className="ai-command-preview"><code>{agentPending}</code><button type="button" onClick={() => void runAgent(true)}>确认并继续</button></div>}{agentSteps.length > 0 && <div className="agent-steps">{agentSteps.map((step, index) => <div key={`${step.command}-${index}`}><code>{index + 1}. $ {step.command}</code><small>{step.stdout || step.stderr || "无输出"}</small></div>)}</div>}</div>
+    <div className="ai-terminal-panel"><div className="ai-terminal-heading"><div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div><span>自动读取输出并继续 · 改删操作确认</span></div><div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="password" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={aiConfigured ? "API Key 已保存，重新输入可更新" : "API Key"} /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiApiKey.trim()}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiApiKey.trim() || !aiModel.trim()}>保存配置</button></div><div className="ai-terminal-prompt"><input value={agentPrompt} onChange={(event) => setAgentPrompt(event.target.value)} placeholder="描述一个完整任务，例如：检查项目错误并修复，然后运行测试" /><button type="button" onClick={() => void runAgent()} disabled={aiBusy || !agentPrompt.trim()}>运行任务</button></div>{agentStatus && <div className="agent-status">{agentStatus}</div>}{agentPending && <div className="ai-command-preview"><code>{agentPending}</code><button type="button" onClick={() => agentToken ? void runAgent(agentToken) : undefined} disabled={!agentToken}>确认并继续</button></div>}{agentSteps.length > 0 && <div className="agent-steps">{agentSteps.map((step, index) => <div key={`${step.command}-${index}`}><code>{index + 1}. $ {step.command}</code><small>{step.stdout || step.stderr || "无输出"}</small></div>)}</div>}</div>
     <div className="terminal-output" ref={outputRef} role="log" aria-live="polite">
       {!entries.length && <div className="terminal-empty">在下方输入命令。命令以当前运行用户身份执行，输出最多保留 1 MB。</div>}
       {entries.map((entry, index) => <div className="terminal-entry" key={`${entry.command}-${index}`}><div className="terminal-prompt"><span>{entry.cwd || "?"}</span><strong>$ {entry.command}</strong></div>{entry.stdout && <pre>{entry.stdout}</pre>}{entry.stderr && <pre className="stderr">{entry.stderr}</pre>}<small>{entry.timedOut ? "超时终止" : `退出 ${entry.exitCode ?? "未知"}`} · {entry.durationMs} ms</small></div>)}

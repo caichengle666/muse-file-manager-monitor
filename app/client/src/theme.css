@@ -140,16 +140,20 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .empty-glyph { width: 62px; height: 62px; display: grid; place-items: center; border: 1px dashed var(--border); color: var(--accent); }
 .loader { width: 28px; height: 28px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
 
-.terminal-panel { min-height: calc(100vh - 70px); display: grid; grid-template-rows: auto auto minmax(320px, 1fr) auto; padding: 18px 0 max(16px, env(safe-area-inset-bottom)); }
-.terminal-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 14px; color: #dce8df; background: #121917; border-bottom: 1px solid #34413c; }
+.terminal-panel { height: calc(100dvh - 86px); min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr) minmax(150px, 34vh) auto; grid-template-areas: "toolbar" "location" "output" "ai" "command"; padding: 18px 0 max(16px, env(safe-area-inset-bottom)); }
+.terminal-toolbar { grid-area: toolbar; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 14px; color: #dce8df; background: #121917; border-bottom: 1px solid #34413c; }
 .terminal-toolbar > div { display: grid; gap: 3px; }
 .terminal-toolbar strong { font: 700 16px/1.2 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
 .terminal-toolbar small { color: #8fa098; font-size: 10px; }
 .terminal-toolbar button { border: 1px solid #42534c; border-radius: 5px; padding: 7px 9px; background: transparent; color: #b5c3bc; font-size: 11px; cursor: pointer; }
-.terminal-location { display: grid; grid-template-columns: 118px 1fr; gap: 8px; padding: 10px; background: #1a2420; border-bottom: 1px solid #34413c; }
+.terminal-location { grid-area: location; display: grid; grid-template-columns: 118px 1fr; gap: 8px; padding: 10px; background: #1a2420; border-bottom: 1px solid #34413c; }
 .terminal-location label { display: grid; gap: 4px; color: #8fa098; font-size: 9px; }
 .terminal-location select, .terminal-location input { min-width: 0; height: 34px; padding: 5px 8px; border: 1px solid #42534c; border-radius: 4px; background: #0d1411; color: #dce8df; font: 11px/1.2 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
-.terminal-output { min-height: 320px; max-height: calc(100vh - 260px); overflow: auto; padding: 14px; background: #08100d; color: #c7d5ce; font: 11px/1.55 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
+.terminal-output { grid-area: output; min-height: 0; max-height: none; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-color: #4b6256 #0d1713; scrollbar-width: thin; padding: 14px; background: #08100d; color: #c7d5ce; font: 11px/1.55 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
+.terminal-output::-webkit-scrollbar { width: 10px; }
+.terminal-output::-webkit-scrollbar-track { background: #0d1713; }
+.terminal-output::-webkit-scrollbar-thumb { border: 2px solid #0d1713; border-radius: 6px; background: #4b6256; }
+.terminal-output::-webkit-scrollbar-thumb:hover { background: #6f8a7b; }
 .terminal-empty { color: #72847b; }
 .terminal-entry { padding: 0 0 16px; }
 .terminal-prompt { display: grid; gap: 2px; margin-bottom: 5px; }
@@ -159,7 +163,7 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .terminal-entry pre.stderr { color: #ff938a; }
 .terminal-entry > small { display: block; margin-top: 5px; color: #70847a; }
 .terminal-running { color: #b7f34a; }
-.terminal-command { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 10px; background: #121917; border-top: 1px solid #34413c; }
+.terminal-command { grid-area: command; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 10px; background: #121917; border-top: 1px solid #34413c; }
 .terminal-command > span { color: #b7f34a; font: 700 14px/1 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
 .terminal-command input { min-width: 0; height: 40px; padding: 8px 10px; border: 1px solid #42534c; border-radius: 4px; background: #08100d; color: #dce8df; font: 12px/1.2 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
 .terminal-command button { height: 40px; padding: 0 14px; border: 0; border-radius: 4px; background: #b7f34a; color: #0b1108; font-weight: 800; cursor: pointer; }
@@ -434,11 +438,11 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .monitor-hero { border-radius: 12px; overflow: hidden; box-shadow: 0 16px 34px rgba(0,0,0,.09); }
 .monitor-grid { gap: 14px; }
 .monitor-grid > section, .host-info-panel, .restart-panel { border-radius: 10px; overflow: hidden; }
-.terminal-panel { min-height: calc(100dvh - 110px); padding-top: 0; border: 1px solid #34413c; border-radius: 10px; overflow: hidden; box-shadow: 0 16px 34px rgba(0,0,0,.12); }
+.terminal-panel { height: calc(100dvh - 110px); min-height: 0; padding-top: 0; border: 1px solid #34413c; border-radius: 10px; overflow: hidden; box-shadow: 0 16px 34px rgba(0,0,0,.12); }
 .terminal-toolbar { padding: 15px 18px; }
 .terminal-location { padding: 12px 14px; }
-.terminal-output { min-height: 360px; }
-.ai-terminal-panel { display: grid; gap: 9px; padding: 13px 14px; border-bottom: 1px solid #34413c; background: #17211d; }
+.terminal-output { min-height: 0; }
+.ai-terminal-panel { grid-area: ai; min-height: 0; overflow: auto; display: grid; gap: 9px; padding: 13px 14px; border-bottom: 1px solid #34413c; background: #17211d; }
 .ai-terminal-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .ai-terminal-heading > div { display: grid; gap: 2px; }
 .ai-terminal-heading strong { color: #dce8df; font: 700 13px/1.2 "IBM Plex Mono", ui-monospace, monospace; }
@@ -458,10 +462,10 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .agent-steps small { color: #8fa098; font: 10px/1.4 "IBM Plex Mono", ui-monospace, monospace; white-space: pre-wrap; max-height: 42px; overflow: hidden; }
 
 @media (min-width: 900px) {
-  .terminal-panel { grid-template-columns: minmax(0, 1fr) 390px; grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "toolbar toolbar" "location location" "output ai" "command ai"; min-height: calc(100dvh - 110px); }
+  .terminal-panel { grid-template-columns: minmax(0, 1fr) 390px; grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "toolbar toolbar" "location location" "output ai" "command ai"; height: calc(100dvh - 110px); min-height: 0; }
   .terminal-toolbar { grid-area: toolbar; }
   .terminal-location { grid-area: location; }
-  .terminal-output { grid-area: output; min-height: 0; max-height: none; border-right: 1px solid #34413c; }
+  .terminal-output { grid-area: output; min-height: 0; max-height: none; overflow-y: scroll; border-right: 1px solid #34413c; }
   .terminal-command { grid-area: command; }
   .ai-terminal-panel { grid-area: ai; align-content: start; min-width: 0; overflow: auto; border-bottom: 0; border-left: 1px solid #34413c; }
   .ai-terminal-config, .ai-terminal-prompt { grid-template-columns: 1fr; }

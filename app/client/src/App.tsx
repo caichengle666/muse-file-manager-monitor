@@ -494,7 +494,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   const [agentToken, setAgentToken] = useState<string | null>(null);
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
   const [aiConfigOpen, setAiConfigOpen] = useState(false);
-  const [agentExpanded, setAgentExpanded] = useState(true);
+  const [agentExpanded, setAgentExpanded] = useState(false);
   const [agentContextLoaded, setAgentContextLoaded] = useState(false);
   const agentStepCountRef = useRef(0);
   const outputRef = useRef<HTMLDivElement>(null);
@@ -543,6 +543,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   async function runAgent(confirmToken?: string) {
     const task = agentPrompt.trim();
     if (!task && !agentTaskId) return;
+    setAgentExpanded(true);
     if (!confirmToken && task) appendAgentMessage({ role: "user", text: task });
     setAiBusy(true);
     let activeTaskId = agentTaskId;

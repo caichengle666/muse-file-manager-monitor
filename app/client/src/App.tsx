@@ -607,6 +607,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
       {busy && <div className="terminal-running">正在执行…</div>}
     </div>
     <form className="terminal-command" onSubmit={submit}><span aria-hidden="true">$</span><input aria-label="Shell 命令" autoCapitalize="off" autoCorrect="off" spellCheck={false} value={command} onChange={(event) => setCommand(event.target.value)} placeholder="例如：pwd && ls -la" /><button type="submit" disabled={busy || !command.trim()}>{busy ? "运行中" : "执行"}</button></form>
+    {!agentExpanded && <div className="ai-collapsed-bar" aria-label="AI Agent 操作"><button type="button" className="ai-panel-toggle" onClick={() => setAgentExpanded(true)}>展开对话</button><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>模型配置</button></div>}
   </section>;
 }
 

@@ -21,10 +21,9 @@ description: "文件管理器 + 系统监控 + 网页终端（TypeScript 全栈�
 1. 先读完本文件、`references/architecture.md` 和 `references/changelog.md`，重点看 changelog 里每个版本"为什么这么改"（比如：私有模式为什么从虚拟文件系统改成真实目录、"上一级"为什么放开、系统启动时间为什么改读 btime）。
 2. 在你的 Muse 里创建一个新的 web_fullstack artifact（名字和 slug 你自己定，不要沿用 `space-2`），把 `app/` 下的 `client/`（React 19 前端）和 `server/`（Bun 后端）源码交给构建器作为起点。
 3. 平台接口：本项目依赖构件平台注入的 `defineAction`、`definePrivilegedContracts`、`ctx.blobs` 和 drizzle 上下文——同一 Muse 构件平台上这些直接可用；换到别的平台，按 `references/architecture.md` 的"独立运行"节写适配层。
-4. 数据库：`app/drizzle/` 下三个 migration 按编号顺序执行：
-   - `0001_initial.sql`：模板自带的 `entries` 表（示例用，可留可删）；
-   - `0002_create_workspace_items.sql`：旧私有虚拟文件系统的 `workspace_items` 表，v1.2 起已废弃（私有改成真实目录），建表语句保留做兼容，业务不再使用；
-   - `0003_add_service_restart_record.sql`：`service_restart_record` 表，服务重启记录用。
+4. 数据库：`app/drizzle/` 下有两个 migration（`meta/_journal.json` 登记执行顺序），都是幂等的 `CREATE TABLE IF NOT EXISTS`：
+   - `workspace_items.sql`：旧私有虚拟文件系统的表，v1.2 起业务已废弃（私有改成真实目录），但十几个旧 action 代码仍引用它，保留建表；
+   - `service_restart_record.sql`：服务重启记录表（累计次数/上次启动时间），监控页用。
 5. 构建完按这份清单验收：文件页四种模式浏览 / 新建 / 删除 / 重命名 / 上传 / 下载；点图片弹出深色查看器（缩放/1:1/下载/左右切换）；监控页 1 秒刷新、九项指标有数；终端能执行命令并返回结果；重启服务后"累计重启次数"加 1。
 6. 安全：网页终端是 RCE 级能力，只部署在你完全控制的私有环境，不要暴露到公网；敏感文件开关默认隐藏。
 

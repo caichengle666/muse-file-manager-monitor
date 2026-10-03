@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.7 — 2026-10-03（drizzle migration 清理 + skill 重建指南）
+
+- drizzle/ 清理：删除模板残留的 `0001_initial.sql`（`entries` 表无任何引用）；`0002_create_workspace_items.sql` → `workspace_items.sql`、`0003_add_service_restart_record.sql` → `service_restart_record.sql`，去掉编号；`meta/_journal.json` 同步重写为两个新 tag；两个 SQL 均为 `CREATE TABLE IF NOT EXISTS` 幂等写法，已有数据库重启不报错
+- SKILL.md 新增 Rebuild 章节：陌生人 Muse 从零重建的完整步骤（读哪三个文档、怎么建构件、migration 说明、平台接口映射、验收清单）
+
 ## v1.6 — 2026-10-03（图片预览）
 
 - 点图片文件（png/jpg/jpeg/gif/webp/bmp/svg，大小写不敏感）弹出深色图片查看器，不再走文本预览

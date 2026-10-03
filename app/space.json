@@ -1,0 +1,8 @@
+{
+  "runtime": "typescript",
+  "platformVersion": 24,
+  "entry": "client/dist/index.html",
+  "name": "文件管理器和监控",
+  "slug": "space-2",
+  "managedCronJobs": ["space-2-cleanup-orphan-blobs"]
+}

@@ -192,8 +192,14 @@ function resolveRequested(start: string, raw: string, showSensitive: boolean): {
   const normalized = raw.replace(/\\/g, "/");
   const absoluteInput = normalized.startsWith("/");
   const parts = normalized.split("/").filter(Boolean);
-  if (parts.some((part) => part === "." || part === ".." || (!showSensitive && blockedNames.test(part)))) return null;
+  if (parts.some((part) => part === "." || part === "..")) return null;
   const absolute = absoluteInput ? resolve("/", ...parts) : resolve(start, ...parts);
+  // Allow an absolute path that repeats the selected root (notably the
+  // artifact's own data/private directory), while still filtering any
+  // user-selected descendants and all paths outside that root.
+  const checkPath = inside(start, absolute) ? relative(start, absolute) : absolute;
+  const checkParts = checkPath.split("/").filter(Boolean);
+  if (!showSensitive && checkParts.some((part) => blockedNames.test(part))) return null;
   return { absolute, relativePath: absolute };
 }
 
@@ -210,7 +216,11 @@ function resolveExisting(start: string, raw: string, showSensitive: boolean): { 
   if (!target) return null;
   try {
     const absolute = realpathSync(target.absolute);
-    const parts = absolute.split("/").filter(Boolean);
+    // The private root itself is intentionally named "private". Treat the
+    // configured root as trusted and apply sensitive-name filtering only to
+    // descendants. If a symlink escapes the root, inspect the full target.
+    const checkPath = inside(start, absolute) ? relative(start, absolute) : absolute;
+    const parts = checkPath.split("/").filter(Boolean);
     if (parts.some((part) => !showSensitive && blockedNames.test(part))) return null;
     return { absolute, relativePath: absolute };
   } catch { return null; }

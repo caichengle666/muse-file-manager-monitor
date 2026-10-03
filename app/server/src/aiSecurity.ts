@@ -37,6 +37,16 @@ export class AiRequestError extends Error {
   }
 }
 
+// The model answered with an empty tool call or empty content. Some
+// OpenAI-compatible proxies drop tool arguments, so callers may retry once
+// instead of failing the whole task.
+export class AiEmptyOutputError extends AiRequestError {
+  constructor(message: string, diagnostic: AiDiagnostic) {
+    super(message, diagnostic);
+    this.name = "AiEmptyOutputError";
+  }
+}
+
 export function describeAiError(error: unknown): AiDiagnostic | null {
   return error instanceof AiRequestError ? error.diagnostic : null;
 }
@@ -129,6 +139,8 @@ export function parseAiCommandContent(content: string): { command: string; expla
   }
   // Last resort: some models ignore the JSON contract and answer with a fenced
   // shell block. Run its first command instead of failing the whole task.
+  const salvaged = salvageAiCommandFields(normalized);
+  if (salvaged) return salvaged;
   const fenced = /```(?:bash|sh|shell)?\s*\n([\s\S]*?)```/i.exec(content);
   const fallback = fenced?.[1]?.split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("#"));
   if (fallback) return { command: fallback, explanation: "模型没有返回 JSON，已改用代码块中的命令。", done: false };
@@ -184,4 +196,56 @@ export function extractAiMessageCommand(message: unknown): AiMessageCommand | nu
   const functionCall = extractAiFunctionCall(record.function_call);
   if (functionCall) return { text: functionCall.arguments, source: "function_call", toolName: functionCall.name };
   return null;
+}
+// Reads a quoted string starting at `startIndex`, tolerating escaped characters
+// and a truncated tail (model output cut off mid-string).
+function readQuotedString(value: string, startIndex: number): { text: string; endIndex: number } | null {
+  const quote = value[startIndex];
+  if (quote !== "\"" && quote !== "'") return null;
+  let out = "";
+  for (let index = startIndex + 1; index < value.length; index += 1) {
+    const char = value[index];
+    if (char === "\\") {
+      const next = value[index + 1];
+      if (next === undefined) break;
+      if (next === "n") out += "\n";
+      else if (next === "t") out += "\t";
+      else if (next === "r") out += "\r";
+      else if (next === "u") {
+        const hex = value.slice(index + 2, index + 6);
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) { out += String.fromCharCode(parseInt(hex, 16)); index += 4; }
+        else out += "u";
+      } else out += next;
+      index += 1;
+      continue;
+    }
+    if (char === quote) return { text: out, endIndex: index };
+    out += char;
+  }
+  return out ? { text: out, endIndex: value.length } : null;
+}
+
+// Last-resort field extraction for malformed JSON (truncated output, trailing
+// commas, single quotes or unquoted keys) without pulling in a JSON repair dep.
+function salvageAiCommandFields(content: string): { command: string; explanation: string; done: boolean } | null {
+  const result: { command?: string; explanation?: string; done?: boolean } = {};
+  const keyPattern = /["']?(command|explanation|done)["']?\s*:\s*/gi;
+  let match: RegExpExecArray | null;
+  while ((match = keyPattern.exec(content)) !== null) {
+    const key = (match[1] ?? "").toLowerCase();
+    const valueStart = match.index + match[0].length;
+    if (key === "done") {
+      const boolMatch = /^(true|false)/i.exec(content.slice(valueStart).trimStart());
+      if (boolMatch) result.done = boolMatch[1]?.toLowerCase() === "true";
+      continue;
+    }
+    const offset = content.slice(valueStart).search(/\S/);
+    if (offset < 0) continue;
+    const parsed = readQuotedString(content, valueStart + offset);
+    if (!parsed) continue;
+    result[key as "command" | "explanation"] = parsed.text;
+    keyPattern.lastIndex = parsed.endIndex + 1;
+  }
+  if (result.command === undefined && result.done !== true) return null;
+  return { command: (result.command ?? "").trim(), explanation: result.explanation ?? "模型输出不是合法 JSON，已从文本中恢复字段。", done: result.done ?? false };
 }

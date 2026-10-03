@@ -1,5 +1,5 @@
 import { defineAction, z, type ActionsModule, type SpaceDb } from "@hatch/space-sdk";
-import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiRequestError, type AiDiagnostic, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiEmptyOutputError, AiRequestError, type AiDiagnostic, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
 import { and, eq, sql } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import { assessCommand } from "./commandPolicy";
@@ -118,6 +118,7 @@ type AiTaskState = {
   pendingCommand: string;
   pendingTokenHash: string | null;
   pendingAutoRun: boolean;
+  emptyRetries: number;
   steps: AiTaskStep[];
   busy: boolean;
   updatedAt: number;
@@ -171,10 +172,10 @@ async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$infe
     try { JSON.parse(content); } catch { content = JSON.stringify({ command: content, explanation: "Tool call returned a raw command.", done: false }); }
   }
   if (content.trim() === "{}") {
-    throw new AiRequestError("模型工具调用没有提供参数", aiDiagnostic("model-json", requestUrl, config.model, `模型调用了 ${messageCommand?.toolName || "工具"}，但 arguments 是空对象，没有 command 字段。`, { status: response.status, responseSnippet: raw.slice(0, 800), contentSnippet: content.slice(0, 800) }));
+    throw new AiEmptyOutputError("模型工具调用没有提供参数", aiDiagnostic("model-json", requestUrl, config.model, `模型调用了 ${messageCommand?.toolName || "工具"}，但 arguments 是空对象，没有 command 字段。`, { status: response.status, responseSnippet: raw.slice(0, 800), contentSnippet: content.slice(0, 800) }));
   }
   if (!content) {
-    throw new AiRequestError("模型没有返回内容", aiDiagnostic("model-json", requestUrl, config.model, "接口调用成功，但 choices[0].message.content 为空。可能是模型名不对、被内容策略拦截，或返回了非标准的流式结构。", { status: response.status, responseSnippet: raw.slice(0, 800) }));
+    throw new AiEmptyOutputError("模型没有返回内容", aiDiagnostic("model-json", requestUrl, config.model, "接口调用成功，但 choices[0].message.content 为空。可能是模型名不对、被内容策略拦截，或返回了非标准的流式结构。", { status: response.status, responseSnippet: raw.slice(0, 800) }));
   }
   try {
     return parseAiCommandContent(content);
@@ -385,7 +386,7 @@ export const Actions = {
       }
       if (state?.busy) return { ok: false, taskId, status: "running" as const, message: "任务正在执行，请等待当前步骤完成。", steps: state.steps, pendingCommand: state.pendingCommand || null, confirmToken: null, diagnostic: null };
       if (!state) {
-        state = { configId: config.id, owner, root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, steps: [], busy: false, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。只读、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
+        state = { configId: config.id, owner, root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, emptyRetries: 0, steps: [], busy: false, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。只读、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
         aiTasks.set(taskId, state);
         pruneAiTasks();
       }
@@ -415,7 +416,19 @@ export const Actions = {
           pushAiMessage(state, { role: "user", content: `命令：${queuedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
           return { ok: true, taskId, status: "running" as const, message: "命令已执行，继续下一步。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
         }
-        const next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS);
+        let next: { command: string; explanation: string; done: boolean };
+        try {
+          next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS);
+        } catch (error) {
+          // Some OpenAI-compatible proxies return an empty tool call once and a
+          // valid one on the next turn. Retry a couple of times before failing.
+          if (error instanceof AiEmptyOutputError && state.emptyRetries < 2) {
+            state.emptyRetries += 1;
+            pushAiMessage(state, { role: "user", content: "上一次回复没有可执行内容。请只输出一个 JSON 对象：{\"command\":\"...\",\"explanation\":\"...\",\"done\":false}，不要使用工具调用，不要留空参数。" });
+            return { ok: true, taskId, status: "running" as const, message: "模型返回为空，已要求它重新输出。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
+          }
+          throw error;
+        }
         if (next.done) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null }; }
         if (!next.command) throw new Error("模型没有返回可执行命令，且未标记任务完成。");
         const assessment = assessCommand(next.command);

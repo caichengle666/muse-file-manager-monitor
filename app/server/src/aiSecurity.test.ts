@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, extractAiMessageCommand, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { AiEmptyOutputError, AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, extractAiMessageCommand, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
 
 describe("SSRF guard", () => {
   test("accepts public OpenAI-compatible hosts", () => {
@@ -76,6 +76,20 @@ describe("model output parsing", () => {
   test("throws on unparseable content", () => {
     expect(() => parseAiCommandContent("not json at all")).toThrow();
   });
+  test("salvages fields from truncated JSON", () => {
+    const truncated = '{"command":"ls -la /home","explanation":"查看目录","done":false';
+    expect(parseAiCommandContent(truncated)).toEqual({ command: "ls -la /home", explanation: "查看目录", done: false });
+  });
+
+  test("salvages fields when JSON uses single quotes", () => {
+    const singleQuoted = "{'command': 'pwd', 'explanation': 'show cwd', 'done': false}";
+    expect(parseAiCommandContent(singleQuoted).command).toBe("pwd");
+  });
+
+  test("salvages a done marker from truncated output", () => {
+    const truncatedDone = '{"command":"","explanation":"全部完成","done":true';
+    expect(parseAiCommandContent(truncatedDone)).toEqual({ command: "", explanation: "全部完成", done: true });
+  });
   test("parses the first object when the model repeats it", () => {
     const repeated = '{"command":"uptime","explanation":"load","done":false}\n\n{"command":"uptime","explanation":"load","done":false}';
     expect(parseAiCommandContent(repeated)).toEqual({ command: "uptime", explanation: "load", done: false });
@@ -99,6 +113,13 @@ describe("error diagnostics", () => {
     expect(describeAiError(new AiRequestError("boom", diagnostic))).toEqual(diagnostic);
     expect(describeAiError(new Error("boom"))).toBeNull();
     expect(describeAiError("boom")).toBeNull();
+  });
+
+  test("marks empty output errors as retryable", () => {
+    const diagnostic = { phase: "model-json" as const, url: "https://example.com/v1/chat/completions", status: 200, model: "x", detail: "empty", responseSnippet: "{}", contentSnippet: "{}" };
+    const error = new AiEmptyOutputError("empty", diagnostic);
+    expect(error).toBeInstanceOf(AiRequestError);
+    expect(describeAiError(error)).toEqual(diagnostic);
   });
 });
 

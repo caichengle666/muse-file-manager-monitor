@@ -65,6 +65,48 @@ function encodeBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function normalizeAiBaseUrl(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+}
+
+function isDestructiveCommand(command: string): boolean {
+  return /(^|[;&|]\s*)(rm|mv|cp|mkdir|rmdir|touch|chmod|chown|kill|pkill|dd|truncate|sed\s+-i|perl\s+-i|python(?:3)?\s+-c|npm\s+(?:install|uninstall)|bun\s+(?:add|remove)|apt(?:-get)?\s+(?:install|remove)|git\s+(?:reset|clean|checkout|restore)|>\s*|>>\s*)/i.test(command);
+}
+
+async function readAiConfig(db: Db): Promise<typeof schema.aiProviderConfig.$inferSelect | null> {
+  await db.run(sql`
+    CREATE TABLE IF NOT EXISTS ai_provider_config (
+      id integer PRIMARY KEY NOT NULL,
+      base_url text NOT NULL,
+      api_key text NOT NULL,
+      model text NOT NULL,
+      updated_at integer NOT NULL
+    )
+  `);
+  const [config] = await db.select().from(schema.aiProviderConfig).where(eq(schema.aiProviderConfig.id, 1)).limit(1);
+  return config ?? null;
+}
+
+async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${normalizeAiBaseUrl(config.baseUrl)}${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", ...(init?.headers ?? {}) },
+  });
+}
+
+type AiTaskMessage = { role: "system" | "user" | "assistant"; content: string };
+type AiTaskState = { configId: number; root: "system" | "workspace" | "build" | "private"; path: string; messages: AiTaskMessage[]; pendingCommand: string; steps: Array<{ command: string; stdout: string; stderr: string; cwd: string; exitCode: number | null; requiresConfirmation: boolean }> };
+const aiTasks = new Map<string, AiTaskState>();
+
+async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[]): Promise<{ command: string; explanation: string; done: boolean }> {
+  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, response_format: { type: "json_object" }, messages }) });
+  const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  if (!response.ok) throw new Error("model request failed");
+  const parsed = JSON.parse(body.choices?.[0]?.message?.content ?? "{}") as { command?: string; explanation?: string; done?: boolean };
+  return { command: String(parsed.command ?? "").trim(), explanation: String(parsed.explanation ?? ""), done: Boolean(parsed.done) };
+}
+
 export const Actions = {
   getFileAccess: defineAction({
     request: z.object({ id: z.number().int().positive() }),
@@ -200,6 +242,93 @@ export const Actions = {
     response: z.object({ ok: z.boolean(), message: z.string(), path: z.string().nullable() }),
     privileged: [privileged.uploadHostFile],
     async handler(ctx, args) { return ctx.executePrivileged(privileged.uploadHostFile, args); },
+  }),
+
+  getAiProviderConfig: defineAction({
+    request: z.object({}),
+    response: z.object({ configured: z.boolean(), baseUrl: z.string(), model: z.string(), apiKeySet: z.boolean(), updatedAt: z.string().nullable() }),
+    async handler(ctx) {
+      const config = await readAiConfig(ctx.db<typeof schema>());
+      return { configured: Boolean(config), baseUrl: config?.baseUrl ?? "https://api.openai.com", model: config?.model ?? "", apiKeySet: Boolean(config?.apiKey), updatedAt: config?.updatedAt.toISOString() ?? null };
+    },
+  }),
+
+  saveAiProviderConfig: defineAction({
+    request: z.object({ baseUrl: z.string().url().max(500), apiKey: z.string().max(500), model: z.string().min(1).max(200) }),
+    response: z.object({ ok: z.boolean(), message: z.string(), models: z.array(z.string()) }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const now = new Date();
+      await db.insert(schema.aiProviderConfig).values({ id: 1, baseUrl: args.baseUrl, apiKey: args.apiKey, model: args.model, updatedAt: now }).onConflictDoUpdate({ target: schema.aiProviderConfig.id, set: { baseUrl: args.baseUrl, apiKey: args.apiKey, model: args.model, updatedAt: now } });
+      return { ok: true, message: "AI 配置已保存到服务器。", models: [] };
+    },
+  }),
+
+  listAiModels: defineAction({
+    request: z.object({ baseUrl: z.string().url().max(500), apiKey: z.string().max(500) }),
+    response: z.object({ ok: z.boolean(), message: z.string(), models: z.array(z.string()) }),
+    async handler(_ctx, args) {
+      try {
+        const response = await fetch(`${normalizeAiBaseUrl(args.baseUrl)}/models`, { headers: { Authorization: `Bearer ${args.apiKey}` } });
+        const body = await response.json() as { data?: Array<{ id?: string }> };
+        const models = (body.data ?? []).map((item) => item.id ?? "").filter(Boolean).sort();
+        return { ok: response.ok, message: response.ok ? `已读取 ${models.length} 个模型。` : "模型列表读取失败。", models };
+      } catch { return { ok: false, message: "无法连接模型服务，请检查地址和网络。", models: [] }; }
+    },
+  }),
+
+  runAiTask: defineAction({
+    request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), approvePending: z.boolean().default(false), maxSteps: z.number().int().min(1).max(30).default(20) }),
+    response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable() }),
+    async handler(ctx, args) {
+      const config = await readAiConfig(ctx.db<typeof schema>());
+      if (!config) return { ok: false, taskId: args.taskId ?? crypto.randomUUID(), status: "failed" as const, message: "请先配置 AI 服务。", steps: [], pendingCommand: null };
+      const taskId = args.taskId ?? crypto.randomUUID();
+      let state = args.taskId ? aiTasks.get(args.taskId) : undefined;
+      if (!state) {
+        state = { configId: config.id, root: args.root, path: args.path, pendingCommand: "", steps: [], messages: [{ role: "system", content: "你是一个沙盒终端 Agent。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。读取、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
+        aiTasks.set(taskId, state);
+      }
+      if (state.pendingCommand) {
+        if (!args.approvePending) return { ok: true, taskId, status: "waiting_confirmation" as const, message: "等待确认后继续。", steps: state.steps, pendingCommand: state.pendingCommand };
+        state.messages.push({ role: "user", content: `用户已确认执行待执行命令：${state.pendingCommand}` });
+        state.pendingCommand = "";
+      }
+      try {
+        for (let step = 0; step < args.maxSteps; step += 1) {
+          const next = await requestNextAiCommand(config, state.messages);
+          if (next.done || !next.command) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null }; }
+          const requiresConfirmation = isDestructiveCommand(next.command);
+          state.messages.push({ role: "assistant", content: JSON.stringify(next) });
+          if (requiresConfirmation) {
+            state.pendingCommand = next.command;
+            return { ok: true, taskId, status: "waiting_confirmation" as const, message: next.explanation || "这一步需要确认。", steps: state.steps, pendingCommand: next.command };
+          }
+          const result = await ctx.executePrivileged(privileged.executeShell, { command: next.command, root: state.root, path: state.path });
+          state.steps.push({ command: next.command, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: false });
+          state.messages.push({ role: "user", content: `命令：${next.command}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
+        }
+        return { ok: true, taskId, status: "running" as const, message: "已达到本轮步数上限，可继续运行任务。", steps: state.steps, pendingCommand: null };
+      } catch { aiTasks.delete(taskId); return { ok: false, taskId, status: "failed" as const, message: "AI Agent 执行失败，请检查模型接口或终端输出。", steps: state.steps, pendingCommand: null }; }
+    },
+  }),
+
+  generateAiShellCommand: defineAction({
+    request: z.object({ prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000) }),
+    response: z.object({ ok: z.boolean(), message: z.string(), command: z.string(), explanation: z.string(), requiresConfirmation: z.boolean() }),
+    async handler(ctx, args) {
+      const config = await readAiConfig(ctx.db<typeof schema>());
+      if (!config) return { ok: false, message: "请先配置 AI 服务。", command: "", explanation: "", requiresConfirmation: false };
+      try {
+        const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, response_format: { type: "json_object" }, messages: [{ role: "system", content: "你是沙盒终端助手。只生成一条 bash 命令，不要执行。返回 JSON：{command:string, explanation:string}。当前工作区根类型和相对路径会由用户提供。优先使用只读命令；修改、删除、移动、安装、权限变更命令必须明确说明。" }, { role: "user", content: `目标：${args.prompt}\n工作区根类型：${args.root}\n相对路径：${args.path || "/"}` }] }) });
+        const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+        const content = body.choices?.[0]?.message?.content ?? "";
+        const parsed = JSON.parse(content) as { command?: string; explanation?: string };
+        const command = String(parsed.command ?? "").trim();
+        if (!response.ok || !command) return { ok: false, message: "模型没有返回可执行命令。", command: "", explanation: "", requiresConfirmation: false };
+        return { ok: true, message: "命令已生成。", command, explanation: String(parsed.explanation ?? ""), requiresConfirmation: isDestructiveCommand(command) };
+      } catch { return { ok: false, message: "AI 请求失败，请检查配置、模型和接口兼容性。", command: "", explanation: "", requiresConfirmation: false }; }
+    },
   }),
 
   executeShell: defineAction({

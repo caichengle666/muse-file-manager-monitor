@@ -24,3 +24,11 @@ export const serviceRestartRecord = sqliteTable("service_restart_record", {
   instanceId: text("instance_id").notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
+
+export const aiProviderConfig = sqliteTable("ai_provider_config", {
+  id: integer("id").primaryKey(),
+  baseUrl: text("base_url").notNull(),
+  apiKey: text("api_key").notNull(),
+  model: text("model").notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});

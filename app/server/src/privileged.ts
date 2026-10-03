@@ -97,7 +97,7 @@ export const privileged = definePrivilegedContracts({
   executeShell: {
     request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000) }),
     response: z.object({ ok: z.boolean(), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), timedOut: z.boolean(), cwd: z.string(), durationMs: z.number().int() }),
-    timeoutMs: 6000,
+    timeoutMs: 30000,
   },
   readSystemSnapshot: {
     request: z.object({}),
@@ -678,11 +678,11 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const cwd = directory?.absolute ?? findRoot(args.root)?.path ?? process.cwd();
     const started = Date.now();
     return new Promise((resolvePromise) => {
-      exec(args.command, { cwd, timeout: 5000, maxBuffer: 1_000_000, shell: "/bin/bash" }, (error, stdout, stderr) => {
+      exec(args.command, { cwd, timeout: 30000, maxBuffer: 1_000_000, shell: "/bin/bash" }, (error, stdout, stderr) => {
         const candidate = error as (Error & { code?: number | string; killed?: boolean; signal?: string }) | null;
         const timedOut = Boolean(candidate?.killed && candidate.signal === "SIGTERM");
         const code = typeof candidate?.code === "number" ? candidate.code : error ? null : 0;
-        resolvePromise({ ok: !error, stdout: String(stdout), stderr: timedOut ? `${String(stderr)}${stderr ? "\n" : ""}命令超过 5 秒，已终止。` : String(stderr), exitCode: code, timedOut, cwd, durationMs: Math.max(0, Date.now() - started) });
+        resolvePromise({ ok: !error, stdout: String(stdout), stderr: timedOut ? `${String(stderr)}${stderr ? "\n" : ""}命令超过 30 秒，已终止。` : String(stderr), exitCode: code, timedOut, cwd, durationMs: Math.max(0, Date.now() - started) });
       });
     });
   },

@@ -457,6 +457,18 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .agent-steps code { color: #b7f34a; font: 11px/1.4 "IBM Plex Mono", ui-monospace, monospace; overflow-wrap: anywhere; }
 .agent-steps small { color: #8fa098; font: 10px/1.4 "IBM Plex Mono", ui-monospace, monospace; white-space: pre-wrap; max-height: 42px; overflow: hidden; }
 
+@media (min-width: 900px) {
+  .terminal-panel { grid-template-columns: minmax(0, 1fr) 390px; grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "toolbar toolbar" "location location" "output ai" "command ai"; min-height: calc(100dvh - 110px); }
+  .terminal-toolbar { grid-area: toolbar; }
+  .terminal-location { grid-area: location; }
+  .terminal-output { grid-area: output; min-height: 0; max-height: none; border-right: 1px solid #34413c; }
+  .terminal-command { grid-area: command; }
+  .ai-terminal-panel { grid-area: ai; align-content: start; min-width: 0; overflow: auto; border-bottom: 0; border-left: 1px solid #34413c; }
+  .ai-terminal-config, .ai-terminal-prompt { grid-template-columns: 1fr; }
+  .ai-terminal-heading { display: grid; gap: 4px; }
+  .ai-terminal-config button, .ai-terminal-prompt button { min-height: 36px; }
+}
+
 .workspace-layout { width: min(1440px, 100%); margin: 0 auto; display: grid; grid-template-columns: 214px minmax(0, 1fr); align-items: stretch; }
 .workspace-rail { position: sticky; top: 68px; height: calc(100dvh - 68px); display: flex; flex-direction: column; gap: 8px; padding: 30px 18px 22px; border-right: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 78%, transparent); }
 .rail-kicker { color: var(--accent); font: 700 9px/1 "IBM Plex Mono", ui-monospace, monospace; letter-spacing: .16em; }

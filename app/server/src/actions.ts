@@ -100,10 +100,13 @@ type AiTaskState = { configId: number; root: "system" | "workspace" | "build" | 
 const aiTasks = new Map<string, AiTaskState>();
 
 async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[]): Promise<{ command: string; explanation: string; done: boolean }> {
-  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, response_format: { type: "json_object" }, messages }) });
-  const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  if (!response.ok) throw new Error("model request failed");
-  const parsed = JSON.parse(body.choices?.[0]?.message?.content ?? "{}") as { command?: string; explanation?: string; done?: boolean };
+  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages }) });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`模型接口 ${response.status}: ${raw.slice(0, 500)}`);
+  const body = JSON.parse(raw) as { choices?: Array<{ message?: { content?: string } }> };
+  const content = body.choices?.[0]?.message?.content ?? "{}";
+  const normalized = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const parsed = JSON.parse(normalized) as { command?: string; explanation?: string; done?: boolean };
   return { command: String(parsed.command ?? "").trim(), explanation: String(parsed.explanation ?? ""), done: Boolean(parsed.done) };
 }
 
@@ -309,7 +312,7 @@ export const Actions = {
           state.messages.push({ role: "user", content: `命令：${next.command}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
         }
         return { ok: true, taskId, status: "running" as const, message: "已达到本轮步数上限，可继续运行任务。", steps: state.steps, pendingCommand: null };
-      } catch { aiTasks.delete(taskId); return { ok: false, taskId, status: "failed" as const, message: "AI Agent 执行失败，请检查模型接口或终端输出。", steps: state.steps, pendingCommand: null }; }
+      } catch (error) { aiTasks.delete(taskId); return { ok: false, taskId, status: "failed" as const, message: `AI Agent 执行失败：${error instanceof Error ? error.message : "未知错误"}`, steps: state.steps, pendingCommand: null }; }
     },
   }),
 
@@ -320,14 +323,17 @@ export const Actions = {
       const config = await readAiConfig(ctx.db<typeof schema>());
       if (!config) return { ok: false, message: "请先配置 AI 服务。", command: "", explanation: "", requiresConfirmation: false };
       try {
-        const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, response_format: { type: "json_object" }, messages: [{ role: "system", content: "你是沙盒终端助手。只生成一条 bash 命令，不要执行。返回 JSON：{command:string, explanation:string}。当前工作区根类型和相对路径会由用户提供。优先使用只读命令；修改、删除、移动、安装、权限变更命令必须明确说明。" }, { role: "user", content: `目标：${args.prompt}\n工作区根类型：${args.root}\n相对路径：${args.path || "/"}` }] }) });
-        const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-        const content = body.choices?.[0]?.message?.content ?? "";
-        const parsed = JSON.parse(content) as { command?: string; explanation?: string };
+        const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages: [{ role: "system", content: "你是沙盒终端助手。只生成一条 bash 命令，不要执行。返回 JSON：{command:string, explanation:string}，不要 Markdown 代码块。当前工作区根类型和相对路径会由用户提供。优先使用只读命令；修改、删除、移动、安装、权限变更命令必须明确说明。" }, { role: "user", content: `目标：${args.prompt}\n工作区根类型：${args.root}\n相对路径：${args.path || "/"}` }] }) });
+        const raw = await response.text();
+        if (!response.ok) throw new Error(`模型接口 ${response.status}: ${raw.slice(0, 500)}`);
+        const body = response.ok ? JSON.parse(raw) as { choices?: Array<{ message?: { content?: string } }> } : null;
+        const content = body?.choices?.[0]?.message?.content ?? "";
+        const normalized = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+        const parsed = JSON.parse(normalized || "{}");
         const command = String(parsed.command ?? "").trim();
         if (!response.ok || !command) return { ok: false, message: "模型没有返回可执行命令。", command: "", explanation: "", requiresConfirmation: false };
         return { ok: true, message: "命令已生成。", command, explanation: String(parsed.explanation ?? ""), requiresConfirmation: isDestructiveCommand(command) };
-      } catch { return { ok: false, message: "AI 请求失败，请检查配置、模型和接口兼容性。", command: "", explanation: "", requiresConfirmation: false }; }
+      } catch (error) { return { ok: false, message: `AI 请求失败：${error instanceof Error ? error.message : "未知错误"}`, command: "", explanation: "", requiresConfirmation: false }; }
     },
   }),
 

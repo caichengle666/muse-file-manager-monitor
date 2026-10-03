@@ -283,6 +283,7 @@ export const Actions = {
   runAiTask: defineAction({
     request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), approvePending: z.boolean().default(false), maxSteps: z.number().int().min(1).max(30).default(20) }),
     response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable() }),
+    privileged: [privileged.executeShell],
     async handler(ctx, args) {
       const config = await readAiConfig(ctx.db<typeof schema>());
       if (!config) return { ok: false, taskId: args.taskId ?? crypto.randomUUID(), status: "failed" as const, message: "请先配置 AI 服务。", steps: [], pendingCommand: null };

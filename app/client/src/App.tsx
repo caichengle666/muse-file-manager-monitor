@@ -582,7 +582,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
         {agentMessages.map((message, index) => <div className={`agent-message ${message.role}`} key={index}>
           <div className="agent-message-role">{message.role === "user" ? "你" : "AI"}</div>
           {message.text && <div className="agent-message-text">{message.text}</div>}
-          {message.steps && message.steps.length > 0 && <div className="agent-message-steps">{message.steps.map((step, stepIndex) => <div key={`${step.command}-${stepIndex}`}><code>$ {step.command}</code>{step.stdout && <pre>{step.stdout}</pre>}{step.stderr && <pre className="stderr">{step.stderr}</pre>}<small>退出 {step.exitCode ?? "未知"} · {step.cwd || "?"}</small></div>)}</div>}
+          {message.steps && message.steps.length > 0 && <div className="agent-message-steps agent-message-steps-compact">{message.steps.map((step, stepIndex) => <div key={`${step.command}-${stepIndex}`}><span>{step.exitCode === 0 ? "命令执行成功" : `命令执行完成 · 退出 ${step.exitCode ?? "未知"}`}</span></div>)}</div>}
           {message.diagnostic && <div className="agent-diagnostic">
             <div className="agent-diagnostic-row"><span>阶段</span><code>{message.diagnostic.phase}</code></div>
             <div className="agent-diagnostic-row"><span>地址</span><code>{message.diagnostic.url}</code></div>

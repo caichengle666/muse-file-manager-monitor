@@ -81,6 +81,22 @@ async function readAiConfig(db: Db): Promise<typeof schema.aiProviderConfig.$inf
   return config ?? null;
 }
 
+async function ensureAiAgentContextTable(db: Db): Promise<void> {
+  await db.run(sql`
+    CREATE TABLE IF NOT EXISTS ai_agent_context (
+      id integer PRIMARY KEY NOT NULL,
+      task_id text,
+      root text NOT NULL,
+      path text NOT NULL,
+      pending_command text NOT NULL DEFAULT '',
+      confirm_token text,
+      messages_json text NOT NULL,
+      state_json text,
+      updated_at integer NOT NULL
+    )
+  `);
+}
+
 function aiDiagnostic(phase: AiDiagnostic["phase"], url: string, model: string, detail: string, extra?: { status?: number | null; responseSnippet?: string; contentSnippet?: string }): AiDiagnostic {
   return { phase, url, model, detail, status: extra?.status ?? null, responseSnippet: extra?.responseSnippet ?? "", contentSnippet: extra?.contentSnippet ?? "" };
 }
@@ -150,6 +166,29 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
     total -= state.messages[removableIndex]?.content.length ?? 0;
     state.messages.splice(removableIndex, 1);
   }
+}
+
+async function persistAiTaskState(db: Db, taskId: string, state: AiTaskState): Promise<void> {
+  await ensureAiAgentContextTable(db);
+  await db.insert(schema.aiAgentContext).values({
+    id: 1,
+    taskId,
+    root: state.root,
+    path: state.path,
+    pendingCommand: state.pendingCommand,
+    confirmToken: null,
+    messagesJson: "[]",
+    stateJson: JSON.stringify({ ...state, busy: false }),
+    updatedAt: new Date(),
+  }).onConflictDoUpdate({ target: schema.aiAgentContext.id, set: {
+    taskId,
+    root: state.root,
+    path: state.path,
+    pendingCommand: state.pendingCommand,
+    confirmToken: null,
+    stateJson: JSON.stringify({ ...state, busy: false }),
+    updatedAt: new Date(),
+  } });
 }
 
 const AI_BASH_TOOL = { type: "function", function: { name: "bash", description: "Run one bash command in the sandbox. Read-only commands run automatically; mutating, deleting, moving, installing or permission-changing commands pause for user confirmation. Set done=true with an empty command when the task is complete.", parameters: { type: "object", properties: { command: { type: "string", description: "The bash command to run; empty when the task is done." }, explanation: { type: "string", description: "Short explanation for this step." }, done: { type: "boolean", description: "Whether the task is complete." } }, required: ["command", "explanation", "done"], additionalProperties: false } } };
@@ -336,6 +375,52 @@ export const Actions = {
     },
   }),
 
+  getAiContext: defineAction({
+    request: z.object({}),
+    response: z.object({ ok: z.boolean(), taskId: z.string().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string(), pendingCommand: z.string(), confirmToken: z.string().nullable(), messages: z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })) }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      await ensureAiAgentContextTable(db);
+      const [row] = await db.select().from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
+      if (!row) return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", confirmToken: null, messages: [] };
+      try {
+        const messages = JSON.parse(row.messagesJson) as unknown;
+        return { ok: true, taskId: row.taskId, root: row.root as "system" | "workspace" | "build" | "private", path: row.path, pendingCommand: row.pendingCommand, confirmToken: row.confirmToken, messages: Array.isArray(messages) ? messages : [] };
+      } catch {
+        await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
+        return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", confirmToken: null, messages: [] };
+      }
+    },
+  }),
+
+  saveAiContext: defineAction({
+    request: z.object({ taskId: z.string().uuid().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), pendingCommand: z.string().max(4000), confirmToken: z.string().max(128).nullable(), messages: z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(20000), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })).max(40) }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      await ensureAiAgentContextTable(db);
+      if (!args.messages.length && !args.taskId && !args.pendingCommand) {
+        await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
+        return { ok: true };
+      }
+      await db.insert(schema.aiAgentContext).values({ id: 1, taskId: args.taskId, root: args.root, path: args.path, pendingCommand: args.pendingCommand, confirmToken: args.confirmToken, messagesJson: JSON.stringify(args.messages), updatedAt: new Date() }).onConflictDoUpdate({ target: schema.aiAgentContext.id, set: { taskId: args.taskId, root: args.root, path: args.path, pendingCommand: args.pendingCommand, confirmToken: args.confirmToken, messagesJson: JSON.stringify(args.messages), updatedAt: new Date() } });
+      return { ok: true };
+    },
+  }),
+
+  clearAiContext: defineAction({
+    request: z.object({}),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      await ensureAiAgentContextTable(db);
+      const [row] = await db.select({ taskId: schema.aiAgentContext.taskId }).from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
+      if (row?.taskId) aiTasks.delete(row.taskId);
+      await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
+      return { ok: true };
+    },
+  }),
+
   saveAiProviderConfig: defineAction({
     request: z.object({ baseUrl: z.string().url().max(500), apiKey: z.string().max(500), model: z.string().min(1).max(200) }),
     response: z.object({ ok: z.boolean(), message: z.string(), models: z.array(z.string()) }),
@@ -382,11 +467,27 @@ export const Actions = {
       // agent loop inside a single request would exceed the platform gateway
       // timeout ("Gateway request timed out"), so the client re-invokes this action
       // with the same taskId until the task completes.
-      const config = await readAiConfig(ctx.db<typeof schema>());
+      const db = ctx.db<typeof schema>();
+      await ensureAiAgentContextTable(db);
+      const config = await readAiConfig(db);
       if (!config) return { ok: false, taskId: args.taskId ?? crypto.randomUUID(), status: "failed" as const, message: "请先配置 AI 服务。", steps: [], pendingCommand: null, confirmToken: null, diagnostic: null };
       const owner = "default";
       const taskId = args.taskId ?? crypto.randomUUID();
       let state = args.taskId ? aiTasks.get(args.taskId) : undefined;
+      if (!state && args.taskId) {
+        const [row] = await db.select().from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
+        if (row?.taskId === args.taskId && row.stateJson) {
+          try {
+            const restored = JSON.parse(row.stateJson) as AiTaskState;
+            if (restored.configId === config.id && restored.owner === owner && Array.isArray(restored.messages) && Array.isArray(restored.steps)) {
+              state = { ...restored, busy: false, updatedAt: Date.now(), pendingTokenHash: restored.pendingCommand ? null : restored.pendingTokenHash };
+              aiTasks.set(taskId, state);
+            }
+          } catch {
+            await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
+          }
+        }
+      }
       if (state && (state.owner !== owner || state.configId !== config.id)) {
         return { ok: false, taskId, status: "failed" as const, message: "任务不存在、已过期，或模型配置已变更，请重新发起。", steps: [], pendingCommand: null, confirmToken: null, diagnostic: null };
       }
@@ -407,7 +508,12 @@ export const Actions = {
           const isAutoRun = state.pendingAutoRun;
           if (!isAutoRun) {
             const providedHash = args.confirmToken ? digestToken(args.confirmToken) : "";
-            if (!state.pendingTokenHash || !providedHash || !constantTimeEqual(providedHash, state.pendingTokenHash)) {
+            if (!state.pendingTokenHash) {
+              const token = randomToken();
+              state.pendingTokenHash = digestToken(token);
+              return { ok: true, taskId, status: "waiting_confirmation" as const, message: "这一步需要用户确认后才能执行。", steps: state.steps, pendingCommand: state.pendingCommand, confirmToken: token, diagnostic: null };
+            }
+            if (!providedHash || !constantTimeEqual(providedHash, state.pendingTokenHash)) {
               return { ok: true, taskId, status: "waiting_confirmation" as const, message: "这一步需要用户确认后才能执行。", steps: state.steps, pendingCommand: state.pendingCommand, confirmToken: null, diagnostic: null };
             }
           }
@@ -455,6 +561,7 @@ export const Actions = {
       } finally {
         state.busy = false;
         state.updatedAt = Date.now();
+        await persistAiTaskState(db, taskId, state);
       }
     },
   }),

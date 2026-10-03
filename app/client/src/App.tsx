@@ -494,12 +494,15 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   const [agentToken, setAgentToken] = useState<string | null>(null);
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
   const [aiConfigOpen, setAiConfigOpen] = useState(false);
+  const [agentContextLoaded, setAgentContextLoaded] = useState(false);
   const agentStepCountRef = useRef(0);
   const outputRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   useEffect(() => { outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight }); }, [entries, busy]);
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight }); }, [agentMessages, aiBusy]);
   useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiApiKey(result.apiKey); setAiModel(result.model); setAiConfigured(result.configured); setAiConfigOpen(!result.configured); }); }, []);
+  useEffect(() => { void api.getAiContext({}).then((result) => { setRoot(result.root); setPath(result.path); setAgentTaskId(result.taskId); setAgentPending(result.pendingCommand); setAgentToken(result.confirmToken); setAgentMessages(result.messages); agentStepCountRef.current = result.messages.reduce((count, message) => count + (message.steps?.length ?? 0), 0); setAgentContextLoaded(true); }); }, []);
+  useEffect(() => { if (!agentContextLoaded) return; void api.saveAiContext({ taskId: agentTaskId, root, path, pendingCommand: agentPending, confirmToken: agentToken, messages: agentMessages }); }, [agentContextLoaded, agentMessages, agentPending, agentTaskId, agentToken, path, root]);
   function submit(event: FormEvent) { event.preventDefault(); const value = command.trim(); if (!value || busy) return; setCommand(""); void onRun(value, root, path); }
   async function saveAi() {
     if (!aiApiKey.trim() || !aiModel.trim()) return;
@@ -524,6 +527,18 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
     } finally { setAiBusy(false); }
   }
   function appendAgentMessage(message: AgentMessage) { setAgentMessages((current) => [...current, message].slice(-40)); }
+  async function clearAgentContext() {
+    setAiBusy(true);
+    try {
+      await api.clearAiContext({});
+      setAgentMessages([]);
+      setAgentTaskId(null);
+      setAgentPending("");
+      setAgentToken(null);
+      setAgentPrompt("");
+      agentStepCountRef.current = 0;
+    } finally { setAiBusy(false); }
+  }
   async function runAgent(confirmToken?: string) {
     const task = agentPrompt.trim();
     if (!task && !agentTaskId) return;
@@ -559,7 +574,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
     <div className="ai-terminal-panel">
       <div className="ai-terminal-heading">
         <div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div>
-        <div className="ai-terminal-heading-actions"><span>自动读取输出并继续 · 改删操作确认</span><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>{aiConfigOpen ? "收起配置" : "模型配置"}</button></div>
+        <div className="ai-terminal-heading-actions"><span>自动读取输出并继续 · 改删操作确认</span><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>{aiConfigOpen ? "收起配置" : "模型配置"}</button></div>
       </div>
       {aiConfigOpen && <div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="text" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder="API Key" /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiApiKey.trim()}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiApiKey.trim() || !aiModel.trim()}>保存配置</button></div>}
       <div className="agent-chat" ref={chatRef} role="log" aria-live="polite">

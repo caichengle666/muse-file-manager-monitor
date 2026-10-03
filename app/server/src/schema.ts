@@ -32,3 +32,15 @@ export const aiProviderConfig = sqliteTable("ai_provider_config", {
   model: text("model").notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
+
+export const aiAgentContext = sqliteTable("ai_agent_context", {
+  id: integer("id").primaryKey(),
+  taskId: text("task_id"),
+  root: text("root").notNull(),
+  path: text("path").notNull(),
+  pendingCommand: text("pending_command").notNull().default(""),
+  confirmToken: text("confirm_token"),
+  messagesJson: text("messages_json").notNull(),
+  stateJson: text("state_json"),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});

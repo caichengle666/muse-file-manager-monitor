@@ -18,9 +18,11 @@ description: "文件管理器 + 系统监控 + 网页终端（TypeScript 全栈�
 
 ## Rebuild（第一次用这个 skill 的 Muse：从零重建看这里）
 
-**先确认模式（默认复刻模式）：**
-- **复刻模式（默认）**：必须原样复用 `app/` 下全部源码（`client/` + `server/` + `drizzle/`），逐文件复制，不重新设计 UI、不改布局、不改文案、不换技术栈。目标是视觉和功能与原版一致。
-- **二开模式**：仅在用户明确要求改动时用，以 `app/` 为起点按要求改，改完按 changelog 记一笔。
+### 铁律（违反视为任务失败）
+1. 用户说"复刻"即默认**复刻模式**，不得询问用户、不得自行切换到重新设计。
+2. 复刻模式 = **逐文件原样复制** `app/` 下全部源码（`client/`、`server/`、`drizzle/`、配置文件）：不重新设计 UI、不改布局、不改文案、不换配色、不换技术栈。完成后的视觉和功能必须与原版一致。
+3. 唯一允许的改动：为适配新环境**必须**改的东西（且要在最终回复里逐项说明改了什么、为什么改）。
+4. **二开模式**仅在用户明确要求改动或加功能时启用；改完按 changelog 记一笔。
 
 1. 先读完本文件、`references/architecture.md` 和 `references/changelog.md`，重点看 changelog 里每个版本"为什么这么改"（比如：私有模式为什么从虚拟文件系统改成真实目录、"上一级"为什么放开、系统启动时间为什么改读 btime）。
 2. 在你的 Muse 里创建一个新的 web_fullstack artifact（名字和 slug 你自己定，不要沿用 `space-2`），把 `app/` 下的 `client/`（React 19 前端）和 `server/`（Bun 后端）源码完整交给构建器。**复刻模式下必须逐文件原样复用，不得重写或重新设计**；平台接口（`defineAction`、`definePrivilegedContracts`、`ctx.blobs`、drizzle 上下文）在同一 Muse 构件平台直接可用。

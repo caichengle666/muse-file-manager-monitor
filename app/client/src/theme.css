@@ -497,6 +497,16 @@ button:disabled { opacity: .52; cursor: not-allowed; }
   .ai-terminal-heading { display: grid; }
 }
 
+@media (min-width: 720px) and (max-width: 1099px) {
+  .workspace-layout { grid-template-columns: 190px minmax(0, 1fr); }
+  .workspace-rail { padding-inline: 14px; }
+  .rail-title { font-size: 16px; }
+  .workspace-layout .content-wrap { padding-inline: 20px; }
+  .mode-switch { width: min(280px, 42vw); }
+  .brand-mark { min-width: 0; }
+  .brand-mark small { display: none; }
+}
+
 @media (min-width: 720px) {
   .content-wrap { padding-top: 22px; }
   .file-hero { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 26px; align-items: end; }

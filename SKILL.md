@@ -51,7 +51,7 @@ cd muse-file-manager-monitor
 5. AI 终端 Agent：复刻时必须保留 `getAiProviderConfig`、`saveAiProviderConfig`、`listAiModels`、`generateAiShellCommand`、`runAiTask` 这些 action。配置流程是：填写 OpenAI-compatible API 地址和 Key → 拉取模型 → 选择模型 → 保存到服务器；模型地址会经过公网校验（拒绝 localhost/私网/链路本地/.local）。Agent 流程是：自然语言任务 → 生成一条命令 → 在沙盒执行 → 把 stdout/stderr 回传模型 → 继续下一步，直到模型返回 `done=true`；需要确认时服务端返回一次性 `confirmToken`，前端确认后原样回传。**`runAiTask` 每次调用只做一件事**（要么问模型要命令，要么执行已排队命令），多步循环由前端反复调用驱动——不要把整个循环塞进一个请求，否则平台网关会报 `Gateway request timed out: spaces.cvm.post`。
 6. 命令权限：命令分类在 `server/src/commandPolicy.ts`，采用**白名单**而非黑名单——只有明确只读的命令和已知测试命令自动执行，其余（修改、删除、移动、安装、权限变更、未识别命令）一律暂停等待确认。服务端会为待确认命令生成一次性 `confirmToken`，前端确认时必须回传，命令内容不匹配或令牌复用都会被拒绝；不要退回成客户端 `approvePending` 布尔值。单条命令最长 30 秒，超时后把结果回传 Agent 并结束该步。
 7. 构建完按这份清单验收：文件页四种模式浏览 / 新建 / 删除 / 重命名 / 上传 / 下载；点图片弹出深色查看器（缩放/1:1/下载/左右切换）；监控页 1 秒刷新、九项指标有数；终端能执行命令并返回结果；AI 配置可拉取模型并落盘；输入多步任务后 Agent 能读取命令输出继续下一步；修改/删除命令会暂停确认；重启服务后"累计重启次数"加 1。
-8. 安全：网页终端和 AI Agent 都是 RCE 级能力，只部署在你完全控制的私有环境，不要暴露到公网；敏感文件开关默认隐藏；公开仓库不要写入真实 API Key、主机名或路径。AI 模型地址必须通过 `requirePublicBaseUrl`（拒绝 localhost/私网/链路本地/.local，且禁用重定向），API Key 明文落盘属于已知限制，请把 `app.db` 当作密钥文件保护。Agent 任务有 30 分钟 TTL、单任务并发锁和 100 个任务上限，任务执行中不要重启服务（内存态会丢）。
+8. 安全：网页终端和 AI Agent 都是 RCE 级能力，只部署在你完全控制的私有环境，不要暴露到公网；敏感文件开关默认隐藏；公开仓库不要写入真实 API Key、主机名或路径。AI 模型地址必须通过 `requirePublicBaseUrl`（拒绝 localhost/私网/链路本地/.local，且禁用重定向）。API Key 明文落盘且配置接口会原样返回、前端以明文输入框展示，这是自用私有部署的有意选择，请把 `app.db` 当作密钥文件保护。Agent 任务有 30 分钟 TTL、单任务并发锁和 100 个任务上限，任务执行中不要重启服务（内存态会丢）。
 
 ## Operating Rules
 

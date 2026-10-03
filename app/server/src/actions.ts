@@ -1,5 +1,5 @@
 import { defineAction, z, type ActionsModule, type SpaceDb } from "@hatch/space-sdk";
-import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiRequestError, type AiDiagnostic, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, redactSecrets, requirePublicBaseUrl } from "./aiSecurity";
+import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiRequestError, type AiDiagnostic, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
 import { and, eq, sql } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import { assessCommand } from "./commandPolicy";
@@ -82,7 +82,7 @@ async function readAiConfig(db: Db): Promise<typeof schema.aiProviderConfig.$inf
 }
 
 function aiDiagnostic(phase: AiDiagnostic["phase"], url: string, model: string, detail: string, extra?: { status?: number | null; responseSnippet?: string; contentSnippet?: string }): AiDiagnostic {
-  return { phase, url, model, detail, status: extra?.status ?? null, responseSnippet: redactSecrets(extra?.responseSnippet ?? ""), contentSnippet: redactSecrets(extra?.contentSnippet ?? "") };
+  return { phase, url, model, detail, status: extra?.status ?? null, responseSnippet: extra?.responseSnippet ?? "", contentSnippet: extra?.contentSnippet ?? "" };
 }
 
 async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path: string, init?: RequestInit, timeoutMs = AI_REQUEST_TIMEOUT_MS): Promise<Response> {
@@ -322,10 +322,10 @@ export const Actions = {
 
   getAiProviderConfig: defineAction({
     request: z.object({}),
-    response: z.object({ configured: z.boolean(), baseUrl: z.string(), model: z.string(), apiKeySet: z.boolean(), updatedAt: z.string().nullable() }),
+    response: z.object({ configured: z.boolean(), baseUrl: z.string(), model: z.string(), apiKey: z.string(), updatedAt: z.string().nullable() }),
     async handler(ctx) {
       const config = await readAiConfig(ctx.db<typeof schema>());
-      return { configured: Boolean(config), baseUrl: config?.baseUrl ?? "https://api.openai.com", model: config?.model ?? "", apiKeySet: Boolean(config?.apiKey), updatedAt: config?.updatedAt.toISOString() ?? null };
+      return { configured: Boolean(config), baseUrl: config?.baseUrl ?? "https://api.openai.com", model: config?.model ?? "", apiKey: config?.apiKey ?? "", updatedAt: config?.updatedAt.toISOString() ?? null };
     },
   }),
 

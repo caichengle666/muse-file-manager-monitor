@@ -499,7 +499,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   const chatRef = useRef<HTMLDivElement>(null);
   useEffect(() => { outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight }); }, [entries, busy]);
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight }); }, [agentMessages, aiBusy]);
-  useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiModel(result.model); setAiConfigured(result.configured); setAiConfigOpen(!result.configured); }); }, []);
+  useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiApiKey(result.apiKey); setAiModel(result.model); setAiConfigured(result.configured); setAiConfigOpen(!result.configured); }); }, []);
   function submit(event: FormEvent) { event.preventDefault(); const value = command.trim(); if (!value || busy) return; setCommand(""); void onRun(value, root, path); }
   async function saveAi() {
     if (!aiApiKey.trim() || !aiModel.trim()) return;
@@ -561,7 +561,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
         <div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div>
         <div className="ai-terminal-heading-actions"><span>自动读取输出并继续 · 改删操作确认</span><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>{aiConfigOpen ? "收起配置" : "模型配置"}</button></div>
       </div>
-      {aiConfigOpen && <div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="password" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={aiConfigured ? "API Key 已保存，重新输入可更新" : "API Key"} /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiApiKey.trim()}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiApiKey.trim() || !aiModel.trim()}>保存配置</button></div>}
+      {aiConfigOpen && <div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="text" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder="API Key" /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiApiKey.trim()}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiApiKey.trim() || !aiModel.trim()}>保存配置</button></div>}
       <div className="agent-chat" ref={chatRef} role="log" aria-live="polite">
         {!agentMessages.length && <div className="agent-chat-empty">描述一个任务，AI 会逐步执行，并把每一步的命令、输出和结论发在这里。</div>}
         {agentMessages.map((message, index) => <div className={`agent-message ${message.role}`} key={index}>

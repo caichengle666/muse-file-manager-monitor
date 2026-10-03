@@ -27,11 +27,6 @@ export type AiDiagnostic = {
   contentSnippet: string;
 };
 
-const SECRET_PATTERN = /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b/g;
-
-export function redactSecrets(value: string): string {
-  return value.replace(SECRET_PATTERN, "[redacted-key]");
-}
 
 export class AiRequestError extends Error {
   readonly diagnostic: AiDiagnostic;

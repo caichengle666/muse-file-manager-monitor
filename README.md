@@ -2,18 +2,15 @@
 
 文件管理器 + 系统监控 + 网页终端，一套 Muse skill。拿去就能复刻出同款构件。
 
-## 你是第一次看到这个仓库？按这四步走
+## 你是第一次看到这个仓库？一句话就行
 
-1. 把仓库 clone 下来：
-   ```bash
-   git clone https://github.com/caichengle666/muse-file-manager-monitor.git
-   ```
-2. 把整个文件夹放进你的 Muse 的 skills 目录（`~/workspace/skills/`）。目录名即 skill 名，不用改。
-3. 跟你的 Muse 说这句话（复制粘贴就行）：
-   > 用 muse-file-manager-monitor 这个 skill，按它 SKILL.md 里 "Rebuild" 章节，从零构建一个文件管理器+监控构件。
-4. 构建完让它按 SKILL.md 里 Rebuild 第 5 步的验收清单逐项验证：文件四种模式浏览/新建/删除/上传下载、图片查看器、监控 1 秒刷新、终端执行命令、重启计数。
+跟你的 Muse 说这句话（复制粘贴）：
 
-你不需要懂代码，Muse 会照着 skill 里的源码（`app/`）和说明全自动搭出来。已实测：只给仓库 URL 就能完整复刻。
+> 帮我按照这个skill https://github.com/caichengle666/muse-file-manager-monitor/blob/main/SKILL.md 复刻一下构件就可以了
+
+你的 Muse 会自己打开链接读 skill、拉取源码、从零构建，构建完按 skill 里的验收清单逐项验证。你不需要懂代码，也不需要手动 clone。
+
+（备选：你也可以手动 `git clone` 到 `~/workspace/skills/`，再让它按 SKILL.md 的 Rebuild 章节构建。）
 
 ## 复刻出来的是什么
 

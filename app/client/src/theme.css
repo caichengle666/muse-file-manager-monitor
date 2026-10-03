@@ -486,8 +486,8 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .agent-chat { flex: 1 1 auto; }
 .ai-terminal-heading, .ai-terminal-config, .ai-terminal-prompt, .ai-command-preview { flex: 0 0 auto; }
 
-@media (min-width: 900px) {
-  .terminal-panel { grid-template-columns: minmax(0, 1fr) 390px; grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "toolbar toolbar" "location location" "output ai" "command ai"; height: calc(100dvh - 110px); min-height: 0; }
+@media (min-width: 1200px) {
+  .terminal-panel { grid-template-columns: minmax(0, 1.15fr) minmax(460px, .85fr); grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "toolbar toolbar" "location location" "output ai" "command ai"; height: calc(100dvh - 110px); min-height: 0; }
   .terminal-toolbar { grid-area: toolbar; }
   .terminal-location { grid-area: location; }
   .terminal-output { grid-area: output; min-height: 0; max-height: none; overflow-y: scroll; border-right: 1px solid #34413c; }
@@ -546,7 +546,7 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 
 @media (min-width: 1040px) {
   .mode-header { padding-left: max(28px, calc((100vw - 1240px) / 2 + 28px)); padding-right: max(28px, calc((100vw - 1240px) / 2 + 28px)); }
-  .content-wrap, .workspace-layout .content-wrap { width: 100%; max-width: none; padding-inline: clamp(28px, 3.2vw, 58px); }
+  .content-wrap, .workspace-layout .content-wrap { width: 100%; max-width: none; padding-inline: clamp(18px, 1.8vw, 32px); }
   .brand-mark { position: absolute; left: max(28px, calc((100vw - 1240px) / 2 + 28px)); }
   .mode-switch { margin-inline: auto; }
   .header-state { position: absolute; right: max(28px, calc((100vw - 1240px) / 2 + 28px)); }

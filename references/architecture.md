@@ -1,4 +1,4 @@
-# 架构说明（源码已逐文件核实，v1.1）
+# 架构说明（源码已逐文件核实，v0.1）
 
 标准的 TypeScript space 三层架构：React 前端经类型化 RPC 调用 Bun 后端；后端分"普通 action"与"特权处理器"两类。
 
@@ -6,7 +6,7 @@
 
 - 三个页签：**文件 / 监控 / 终端**；文件页下四种浏览模式（`system` / `workspace` / `build` / `private`），用 `useState` 状态机切换数据源。
 - 经 `app/client/src/api.ts` 类型化 RPC 代理调用后端（POST 到 `./actions`）；React Query 做请求缓存；监控图表用 recharts；图标为手写 SVG 路径（13 种线条图标）。
-- 监控页每 3 秒轮询快照，前端保留最近 30 个采样点画历史曲线。
+- 监控页每 1 秒轮询快照，前端保留最近 60 个采样点画历史曲线。
 
 ## 2. 私有模式（v1.2 起：真实目录，不再是虚拟存储）
 
@@ -26,12 +26,12 @@
 | `readHostTextFile` | 读文本文件。v1.1 起支持分块/分页读取，大文件不再被 500KB 一刀切 |
 | `writeHostTextFile` | 写文本文件。先校验文本类型与 W_OK 写权限；目录可写时用"同目录临时文件 + rename"原子写入（保留原 mode），目录不可写但文件可写时降级为直接覆盖；失败清理临时文件 |
 | `runCommand`（v1.1 新增） | 执行 shell 命令，单次 5 秒超时，终端页签用它 |
-| `getSystemSnapshot` | 监控快照：CPU 取两次 `/proc/stat` 间隔 **1 秒**算差值（v1.1 前是 220ms，抖动大，现加最近 5 次滑动平均）；内存读 `/proc/meminfo`（MemAvailable）；磁盘 `statfs("/")`；网络两次读 `/proc/net/dev`（排除 lo）算每秒速率；扫 `/proc/<pid>/stat` 取前 18 个进程按 CPU 排序 |
+| `getSystemSnapshot` | 监控快照：CPU 取两次 `/proc/stat` 间隔 **1 秒**算差值（v1.1 前是 220ms，抖动大，现加最近 5 次滑动平均）；内存读 `/proc/meminfo`（MemAvailable）；磁盘 `statfs("/")`；网络两次读 `/proc/net/dev`（排除 lo）算每秒速率；扫 `/proc/<pid>/stat` 取 Top 进程，支持按 CPU / 内存两种排序 |
 
 ## 4. 安全机制（v1.1 已放宽，保留底线）
 
 - **敏感文件过滤加开关**：`blockedNames` 正则（`.env`、`credentials`、`*secret*`、`*password*`、`*token*`、`.ssh`、`*.pem`、`*.key`、`id_rsa*` 等）默认隐藏，界面可切换显示。
-- **目录穿越防护**：`safeRelative` + `resolveInside`，路径含 `..` 直接拒绝，解析后必须仍在根目录内。
+- **目录穿越防护**：`safeRelative` + `resolveInside`，路径含 `..` 直接拒绝；各模式根目录现为"起始目录"（不再是围墙），允许"上一级"一路向上导航到 `/`，仅在 `/` 时禁用。
 - **符号链接**：v1.1 起允许跟随（此前只列出不跟随）。
 - **文本判定** `isLikelyText`：43 种已知文本扩展名直接放行，否则检查文件头 64KB——含 NUL 字节、UTF-8 严格解码失败、或控制字符超 2% 即判二进制；二进制不再直接拒绝，提供 hex 预览或下载。
 - **编辑门控**：前端编辑按钮仅当后端返回 `editable=true`（文本类型 + 有写权限）才显示。
@@ -50,10 +50,11 @@
 ## 7. 服务重启记录（v1.3）
 
 - 新增数据库表（drizzle 迁移）：累计重启次数 + 每次启动时间戳，持久化，重启不清零。
-- 登记时机：当前运行时没有"服务启动前"生命周期钩子，登记发生在首次 `getSystemSnapshot` 请求时（懒登记）；快照返回 `restartCount` / `lastRestartAt` / `bootedAt`，前端 3 秒轮询展示，本地时间精确到秒，另有本次 uptime。
+- 登记时机：当前运行时没有"服务启动前"生命周期钩子，登记发生在首次 `getSystemSnapshot` 请求时（懒登记）；快照返回 `restartCount` / `lastRestartAt` / `bootedAt`，前端 1 秒轮询展示，本地时间精确到秒，另有本次 uptime。
 - 已知局限：多 worker 部署下同一服务实例可能被重复计数；单进程部署实测"终止→拉起"计数 1→2、前次启动时间保留，正确。
 
 ## 6. 数据
 
-- 私有文件：v1.2 起直接存于沙盒真实目录 `data/private`；旧的 `workspace_items` 表（SQLite）仅为 v1.1 遗留，不再使用。
-- 无外部数据源（见 `app/DATA-PLAN.md`）：内容全部来自用户输入与本机采集。
+- 私有文件：v1.2 起直接存于沙盒真实目录 `data/private`；旧的 `workspace_items` 表（SQLite）业务已废弃，但 `getFileAccess` 实现仍引用，保留建表。
+- 旧的 `workspace_items` 表：v1.2 起业务废弃，但 `getFileAccess`（敏感文件开关）实现仍引用它，保留建表。
+- 无外部数据源：内容全部来自用户输入与本机采集。

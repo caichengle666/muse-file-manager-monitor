@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, redactSecrets, requirePublicBaseUrl } from "./aiSecurity";
+import { AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, extractAiMessageCommand, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, redactSecrets, requirePublicBaseUrl } from "./aiSecurity";
 
 describe("SSRF guard", () => {
   test("accepts public OpenAI-compatible hosts", () => {
@@ -109,5 +109,20 @@ describe("error diagnostics", () => {
     expect(extractAiContent(undefined)).toBe("");
     expect(extractAiContent(null)).toBe("");
     expect(extractAiContent(42)).toBe("");
+  });
+
+  test("reads command arguments from an OpenAI tool_call", () => {
+    const message = { content: null, tool_calls: [{ type: "function", function: { name: "bash", arguments: '{"command":"ls -la /","explanation":"list","done":false}' } }] };
+    expect(extractAiMessageCommand(message)).toEqual({ text: '{"command":"ls -la /","explanation":"list","done":false}', source: "tool_call", toolName: "bash" });
+  });
+
+  test("reads arguments from a legacy function_call", () => {
+    const message = { content: "", function_call: { name: "bash", arguments: '{"command":"pwd","explanation":"","done":false}' } };
+    expect(extractAiMessageCommand(message)?.source).toBe("function_call");
+  });
+
+  test("keeps an empty tool_call so the caller can diagnose it", () => {
+    const message = { content: null, tool_calls: [{ type: "function", function: { name: "bash", arguments: "{}" } }] };
+    expect(extractAiMessageCommand(message)).toEqual({ text: "{}", source: "tool_call", toolName: "bash" });
   });
 });

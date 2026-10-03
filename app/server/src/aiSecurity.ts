@@ -130,3 +130,40 @@ export function extractAiContent(value: unknown): string {
   }
   return "";
 }
+
+export type AiToolCall = { name: string; arguments: string };
+
+function readAiToolCall(value: unknown): AiToolCall | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as { function?: unknown; name?: unknown; arguments?: unknown };
+  const fn = record.function && typeof record.function === "object" ? record.function as { name?: unknown; arguments?: unknown } : record;
+  const name = typeof fn.name === "string" ? fn.name : "";
+  const rawArguments = fn.arguments;
+  const args = typeof rawArguments === "string" ? rawArguments : rawArguments && typeof rawArguments === "object" ? JSON.stringify(rawArguments) : "";
+  return { name, arguments: args };
+}
+
+export function extractAiToolCalls(value: unknown): AiToolCall[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(readAiToolCall).filter((call): call is AiToolCall => call !== null);
+}
+
+export function extractAiFunctionCall(value: unknown): AiToolCall | null {
+  return readAiToolCall(value);
+}
+
+export type AiMessageCommand = { text: string; source: "content" | "tool_call" | "function_call"; toolName: string };
+
+// Some OpenAI-compatible models answer with tool_calls or function_call instead of
+// a JSON content string. Prefer text content, then fall back to tool arguments.
+export function extractAiMessageCommand(message: unknown): AiMessageCommand | null {
+  if (!message || typeof message !== "object") return null;
+  const record = message as { content?: unknown; tool_calls?: unknown; function_call?: unknown };
+  const content = extractAiContent(record.content);
+  if (content.trim()) return { text: content, source: "content", toolName: "" };
+  const firstToolCall = extractAiToolCalls(record.tool_calls)[0];
+  if (firstToolCall) return { text: firstToolCall.arguments, source: "tool_call", toolName: firstToolCall.name };
+  const functionCall = extractAiFunctionCall(record.function_call);
+  if (functionCall) return { text: functionCall.arguments, source: "function_call", toolName: functionCall.name };
+  return null;
+}

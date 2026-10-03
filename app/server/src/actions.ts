@@ -1,5 +1,5 @@
 import { defineAction, z, type ActionsModule, type SpaceDb } from "@hatch/space-sdk";
-import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiRequestError, type AiDiagnostic, constantTimeEqual, describeAiError, digestToken, extractAiContent, parseAiCommandContent, randomToken, redactSecrets, requirePublicBaseUrl } from "./aiSecurity";
+import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiRequestError, type AiDiagnostic, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, redactSecrets, requirePublicBaseUrl } from "./aiSecurity";
 import { and, eq, sql } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import { assessCommand } from "./commandPolicy";
@@ -152,20 +152,27 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
 }
 
 async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[], timeoutMs: number): Promise<{ command: string; explanation: string; done: boolean }> {
-  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages }) }, timeoutMs);
+  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages, tools: [{ type: "function", function: { name: "bash", description: "Run one bash command in the sandbox. Read-only commands run automatically; mutating, deleting, moving, installing or permission-changing commands pause for user confirmation. Set done=true with an empty command when the task is complete.", parameters: { type: "object", properties: { command: { type: "string", description: "The bash command to run; empty when the task is done." }, explanation: { type: "string", description: "Short explanation for this step." }, done: { type: "boolean", description: "Whether the task is complete." } }, required: ["command", "explanation", "done"], additionalProperties: false } } }] }) }, timeoutMs);
   const raw = await response.text();
   const requestUrl = requirePublicBaseUrl(config.baseUrl) + "/chat/completions";
   if (!response.ok) {
     const snippet = raw.slice(0, 800);
     throw new AiRequestError(`模型接口返回 HTTP ${response.status}`, aiDiagnostic("http", requestUrl, config.model, `服务端拒绝了这次对话请求（HTTP ${response.status}）。常见原因：模型名不可用、该模型不支持对话接口、余额或额度不足、API Key 没有该模型权限。`, { status: response.status, responseSnippet: snippet }));
   }
-  let body: { choices?: Array<{ message?: { content?: unknown } }> };
+  let body: { choices?: Array<{ message?: unknown }> };
   try {
     body = JSON.parse(raw) as typeof body;
   } catch {
     throw new AiRequestError("模型接口返回的不是合法 JSON", aiDiagnostic("response-json", requestUrl, config.model, "接口返回了非 JSON 内容，可能是中转站错误页或网关拦截页。", { status: response.status, responseSnippet: raw.slice(0, 800) }));
   }
-  const content = extractAiContent(body.choices?.[0]?.message?.content);
+  const messageCommand = extractAiMessageCommand(body.choices?.[0]?.message);
+  let content = messageCommand?.text ?? "";
+  if (messageCommand && messageCommand.source !== "content" && content) {
+    try { JSON.parse(content); } catch { content = JSON.stringify({ command: content, explanation: "Tool call returned a raw command.", done: false }); }
+  }
+  if (content.trim() === "{}") {
+    throw new AiRequestError("模型工具调用没有提供参数", aiDiagnostic("model-json", requestUrl, config.model, `模型调用了 ${messageCommand?.toolName || "工具"}，但 arguments 是空对象，没有 command 字段。`, { status: response.status, responseSnippet: raw.slice(0, 800), contentSnippet: content.slice(0, 800) }));
+  }
   if (!content) {
     throw new AiRequestError("模型没有返回内容", aiDiagnostic("model-json", requestUrl, config.model, "接口调用成功，但 choices[0].message.content 为空。可能是模型名不对、被内容策略拦截，或返回了非标准的流式结构。", { status: response.status, responseSnippet: raw.slice(0, 800) }));
   }
@@ -360,7 +367,6 @@ export const Actions = {
 
   runAiTask: defineAction({
     request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), confirmToken: z.string().max(128).nullable().default(null) }),
-    response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable(), confirmToken: z.string().nullable() }),
     response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable(), confirmToken: z.string().nullable(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable() }),
     privileged: [privileged.executeShell],
     async handler(ctx, args) {
@@ -410,7 +416,8 @@ export const Actions = {
           return { ok: true, taskId, status: "running" as const, message: "命令已执行，继续下一步。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
         }
         const next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS);
-        if (next.done || !next.command) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null }; }
+        if (next.done) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null }; }
+        if (!next.command) throw new Error("模型没有返回可执行命令，且未标记任务完成。");
         const assessment = assessCommand(next.command);
         pushAiMessage(state, { role: "assistant", content: JSON.stringify(next) });
         state.pendingCommand = next.command;

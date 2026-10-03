@@ -140,7 +140,9 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .empty-glyph { width: 62px; height: 62px; display: grid; place-items: center; border: 1px dashed var(--border); color: var(--accent); }
 .loader { width: 28px; height: 28px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
 
-.terminal-panel { height: calc(100dvh - 86px); min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr) minmax(150px, 34vh) auto; grid-template-areas: "toolbar" "location" "output" "ai" "command"; padding: 18px 0 max(16px, env(safe-area-inset-bottom)); }
+.terminal-panel { height: calc(100dvh - 86px); min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(120px, 30vh) minmax(0, 1fr) auto; grid-template-areas: "toolbar" "location" "output" "ai" "command"; padding: 18px 0 max(16px, env(safe-area-inset-bottom)); }
+
+/* Terminal page: keep the shell output bounded on phones and give the AI chat the remaining space. */
 .terminal-toolbar { grid-area: toolbar; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 14px; color: #dce8df; background: #121917; border-bottom: 1px solid #34413c; }
 .terminal-toolbar > div { display: grid; gap: 3px; }
 .terminal-toolbar strong { font: 700 16px/1.2 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
@@ -442,11 +444,29 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .terminal-toolbar { padding: 15px 18px; }
 .terminal-location { padding: 12px 14px; }
 .terminal-output { min-height: 0; }
-.ai-terminal-panel { grid-area: ai; min-height: 0; overflow: auto; display: grid; gap: 9px; padding: 13px 14px; border-bottom: 1px solid #34413c; background: #17211d; }
+.ai-terminal-panel { grid-area: ai; min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 9px; padding: 13px 14px; border-bottom: 1px solid #34413c; background: #17211d; }
 .ai-terminal-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .ai-terminal-heading > div { display: grid; gap: 2px; }
 .ai-terminal-heading strong { color: #dce8df; font: 700 13px/1.2 "IBM Plex Mono", ui-monospace, monospace; }
 .ai-terminal-heading small, .ai-terminal-heading > span { color: #8fa098; font-size: 10px; }
+.ai-terminal-heading-actions { display: flex; align-items: center; gap: 10px; }
+.ai-terminal-heading-actions > span { color: #8fa098; font-size: 10px; }
+.ai-config-toggle { min-height: 28px; padding: 4px 9px; border: 1px solid #52665b; border-radius: 4px; background: transparent; color: #b5c3bc; font-size: 10px; cursor: pointer; }
+.ai-config-toggle:hover { border-color: #b7f34a; color: #dce8df; }
+.agent-chat { min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: grid; align-content: start; gap: 8px; padding: 8px 2px; }
+.agent-chat-empty { padding: 10px 12px; border: 1px dashed #34413c; border-radius: 6px; color: #8fa098; font-size: 11px; line-height: 1.5; }
+.agent-message { display: grid; gap: 4px; padding: 9px 11px; border-radius: 8px; font-size: 11px; line-height: 1.55; }
+.agent-message.user { justify-self: end; max-width: 88%; background: #24322b; color: #dce8df; }
+.agent-message.assistant { justify-self: start; width: 100%; border: 1px solid #34413c; background: #0d1411; color: #c7d5ce; }
+.agent-message.pending { opacity: .72; }
+.agent-message-role { color: #8fa098; font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
+.agent-message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-message-steps { display: grid; gap: 6px; margin-top: 2px; }
+.agent-message-steps > div { display: grid; gap: 3px; padding: 7px 8px; border-left: 2px solid #4b6256; background: #08100d; }
+.agent-message-steps code { color: #b7f34a; font: 11px/1.4 "IBM Plex Mono", ui-monospace, monospace; overflow-wrap: anywhere; }
+.agent-message-steps pre { max-height: 180px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #c7d5ce; font: 10px/1.5 "IBM Plex Mono", ui-monospace, monospace; }
+.agent-message-steps pre.stderr { color: #f0a37a; }
+.agent-message-steps small { color: #8fa098; font-size: 9px; }
 .ai-terminal-config, .ai-terminal-prompt { display: grid; grid-template-columns: minmax(160px, 1.4fr) minmax(130px, 1fr) minmax(120px, .8fr) auto auto; gap: 7px; }
 .ai-terminal-prompt { grid-template-columns: minmax(0, 1fr) auto; }
 .ai-terminal-config input, .ai-terminal-config select, .ai-terminal-prompt input { min-width: 0; height: 34px; padding: 6px 8px; border: 1px solid #42534c; border-radius: 4px; background: #0d1411; color: #dce8df; font: 10px/1.2 "IBM Plex Mono", ui-monospace, monospace; }
@@ -455,11 +475,8 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .ai-command-preview { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 10px; align-items: center; padding: 9px 10px; border: 1px solid #52665b; background: #0d1411; }
 .ai-command-preview code { overflow-wrap: anywhere; color: #b7f34a; font: 12px/1.45 "IBM Plex Mono", ui-monospace, monospace; }
 .ai-command-preview small { grid-column: 1; color: #8fa098; font-size: 10px; }
-.agent-status { padding: 8px 10px; border-left: 2px solid #b7f34a; background: #0d1411; color: #c7d5ce; font-size: 11px; }
-.agent-steps { display: grid; gap: 6px; max-height: 180px; overflow: auto; padding: 8px 10px; border: 1px solid #34413c; background: #0d1411; }
-.agent-steps > div { display: grid; gap: 3px; }
-.agent-steps code { color: #b7f34a; font: 11px/1.4 "IBM Plex Mono", ui-monospace, monospace; overflow-wrap: anywhere; }
-.agent-steps small { color: #8fa098; font: 10px/1.4 "IBM Plex Mono", ui-monospace, monospace; white-space: pre-wrap; max-height: 42px; overflow: hidden; }
+.agent-chat { flex: 1 1 auto; }
+.ai-terminal-heading, .ai-terminal-config, .ai-terminal-prompt, .ai-command-preview { flex: 0 0 auto; }
 
 @media (min-width: 900px) {
   .terminal-panel { grid-template-columns: minmax(0, 1fr) 390px; grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "toolbar toolbar" "location location" "output ai" "command ai"; height: calc(100dvh - 110px); min-height: 0; }
@@ -467,7 +484,7 @@ button:disabled { opacity: .52; cursor: not-allowed; }
   .terminal-location { grid-area: location; }
   .terminal-output { grid-area: output; min-height: 0; max-height: none; overflow-y: scroll; border-right: 1px solid #34413c; }
   .terminal-command { grid-area: command; }
-  .ai-terminal-panel { grid-area: ai; align-content: start; min-width: 0; overflow: auto; border-bottom: 0; border-left: 1px solid #34413c; }
+  .ai-terminal-panel { grid-area: ai; min-width: 0; overflow: hidden; border-bottom: 0; border-left: 1px solid #34413c; }
   .ai-terminal-config, .ai-terminal-prompt { grid-template-columns: 1fr; }
   .ai-terminal-heading { display: grid; gap: 4px; }
   .ai-terminal-config button, .ai-terminal-prompt button { min-height: 36px; }

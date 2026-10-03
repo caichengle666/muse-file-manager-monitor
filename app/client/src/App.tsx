@@ -27,7 +27,8 @@ type HostDialog =
   | { type: "move"; item: HostEntry }
   | { type: "delete"; item: HostEntry }
   | null;
-type TerminalEntry = { command: string; stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; cwd: string; durationMs: number };
+type TerminalEntry = { command: string; stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; cwd: string; durationMs: number; source?: "shell" | "agent" };
+type AgentStep = { command: string; stdout: string; stderr: string; cwd: string; exitCode: number | null; requiresConfirmation: boolean };
 type MonitorHistory = { time: string; cpu: number; memory: number; rx: number; tx: number; [key: string]: string | number };
 type DirectoryUsage = { name: string; path: string; size: number; timedOut: boolean };
 type ImageViewerState = {
@@ -140,6 +141,7 @@ export function App() {
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>([]);
   const [terminalBusy, setTerminalBusy] = useState(false);
   const terminalCwdRef = useRef<Record<string, string>>({});
+  const agentMirrorRef = useRef(0);
   const hostUploadRef = useRef<HTMLInputElement>(null);
 
   const hostQuery = useQuery({
@@ -300,6 +302,14 @@ export function App() {
     } finally { setTerminalBusy(false); }
   }
 
+  function mirrorAgentSteps(steps: AgentStep[]) {
+    if (steps.length < agentMirrorRef.current) agentMirrorRef.current = 0;
+    if (steps.length <= agentMirrorRef.current) return;
+    const appended = steps.slice(agentMirrorRef.current).map((step) => ({ command: step.command, stdout: step.stdout, stderr: step.stderr, exitCode: step.exitCode, timedOut: false, cwd: step.cwd, durationMs: 0, source: "agent" as const }));
+    agentMirrorRef.current = steps.length;
+    setTerminalHistory((current) => [...current, ...appended].slice(-30));
+  }
+
   async function scanHomeUsage() {
     if (directoryScanBusy) return;
     setDirectoryScanBusy(true);
@@ -390,7 +400,7 @@ export function App() {
             />
           </section>
         ) : tab === "terminal" ? (
-          <TerminalView entries={terminalHistory} busy={terminalBusy} onRun={runTerminal} onClear={() => setTerminalHistory([])} />
+          <TerminalView entries={terminalHistory} busy={terminalBusy} onRun={runTerminal} onClear={() => { setTerminalHistory([]); agentMirrorRef.current = 0; }} onAgentSteps={mirrorAgentSteps} />
         ) : (
           <MonitorView snapshot={snapshot} history={history} loading={monitorQuery.isPending} error={monitorQuery.isError} onRefresh={() => void monitorQuery.refetch()} directoryUsage={directoryUsage} scanBusy={directoryScanBusy} scanProgress={directoryScanProgress} onScan={() => void scanHomeUsage()} />
         )}
@@ -466,7 +476,7 @@ function HostFilesView({ query, root, path, busy, showSensitive, uploadRef, onUp
   </div>;
 }
 
-function TerminalView({ entries, busy, onRun, onClear }: { entries: TerminalEntry[]; busy: boolean; onRun: (command: string, root: HostRoot, path: string) => Promise<void>; onClear: () => void }) {
+function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries: TerminalEntry[]; busy: boolean; onRun: (command: string, root: HostRoot, path: string) => Promise<void>; onClear: () => void; onAgentSteps: (steps: AgentStep[]) => void }) {
   const [command, setCommand] = useState("");
   const [root, setRoot] = useState<HostRoot>("workspace");
   const [path, setPath] = useState("");
@@ -481,7 +491,7 @@ function TerminalView({ entries, busy, onRun, onClear }: { entries: TerminalEntr
   const [agentStatus, setAgentStatus] = useState("");
   const [agentPending, setAgentPending] = useState("");
   const [agentToken, setAgentToken] = useState<string | null>(null);
-  const [agentSteps, setAgentSteps] = useState<Array<{ command: string; stdout: string; stderr: string }>>([]);
+  const [agentSteps, setAgentSteps] = useState<AgentStep[]>([]);
   const outputRef = useRef<HTMLDivElement>(null);
   useEffect(() => { outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight }); }, [entries, busy]);
   useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiModel(result.model); setAiConfigured(result.configured); }); }, []);
@@ -497,7 +507,8 @@ function TerminalView({ entries, busy, onRun, onClear }: { entries: TerminalEntr
       setAgentStatus(result.message);
       setAgentPending(result.pendingCommand ?? "");
       setAgentToken(result.confirmToken ?? null);
-      setAgentSteps(result.steps.map((step) => ({ command: step.command, stdout: step.stdout, stderr: step.stderr })));
+      setAgentSteps(result.steps);
+      onAgentSteps(result.steps);
       if (result.status === "completed") { setAgentPrompt(""); setAgentToken(null); }
     } finally { setAiBusy(false); }
   }
@@ -507,7 +518,7 @@ function TerminalView({ entries, busy, onRun, onClear }: { entries: TerminalEntr
     <div className="ai-terminal-panel"><div className="ai-terminal-heading"><div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div><span>自动读取输出并继续 · 改删操作确认</span></div><div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="password" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={aiConfigured ? "API Key 已保存，重新输入可更新" : "API Key"} /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiApiKey.trim()}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiApiKey.trim() || !aiModel.trim()}>保存配置</button></div><div className="ai-terminal-prompt"><input value={agentPrompt} onChange={(event) => setAgentPrompt(event.target.value)} placeholder="描述一个完整任务，例如：检查项目错误并修复，然后运行测试" /><button type="button" onClick={() => void runAgent()} disabled={aiBusy || !agentPrompt.trim()}>运行任务</button></div>{agentStatus && <div className="agent-status">{agentStatus}</div>}{agentPending && <div className="ai-command-preview"><code>{agentPending}</code><button type="button" onClick={() => agentToken ? void runAgent(agentToken) : undefined} disabled={!agentToken}>确认并继续</button></div>}{agentSteps.length > 0 && <div className="agent-steps">{agentSteps.map((step, index) => <div key={`${step.command}-${index}`}><code>{index + 1}. $ {step.command}</code><small>{step.stdout || step.stderr || "无输出"}</small></div>)}</div>}</div>
     <div className="terminal-output" ref={outputRef} role="log" aria-live="polite">
       {!entries.length && <div className="terminal-empty">在下方输入命令。命令以当前运行用户身份执行，输出最多保留 1 MB。</div>}
-      {entries.map((entry, index) => <div className="terminal-entry" key={`${entry.command}-${index}`}><div className="terminal-prompt"><span>{entry.cwd || "?"}</span><strong>$ {entry.command}</strong></div>{entry.stdout && <pre>{entry.stdout}</pre>}{entry.stderr && <pre className="stderr">{entry.stderr}</pre>}<small>{entry.timedOut ? "超时终止" : `退出 ${entry.exitCode ?? "未知"}`} · {entry.durationMs} ms</small></div>)}
+      {entries.map((entry, index) => <div className="terminal-entry" key={`${entry.command}-${index}`}><div className="terminal-prompt"><span>{entry.cwd || "?"}</span><strong>{entry.source === "agent" ? "AI $ " : "$ "}{entry.command}</strong></div>{entry.stdout && <pre>{entry.stdout}</pre>}{entry.stderr && <pre className="stderr">{entry.stderr}</pre>}<small>{entry.timedOut ? "超时终止" : `退出 ${entry.exitCode ?? "未知"}`}{entry.durationMs ? ` · ${entry.durationMs} ms` : ""}</small></div>)}
       {busy && <div className="terminal-running">正在执行…</div>}
     </div>
     <form className="terminal-command" onSubmit={submit}><span aria-hidden="true">$</span><input aria-label="Shell 命令" autoCapitalize="off" autoCorrect="off" spellCheck={false} value={command} onChange={(event) => setCommand(event.target.value)} placeholder="例如：pwd && ls -la" /><button type="submit" disabled={busy || !command.trim()}>{busy ? "运行中" : "执行"}</button></form>

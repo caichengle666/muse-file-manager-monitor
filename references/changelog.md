@@ -20,6 +20,8 @@
 - 命令权限从正则黑名单改成白名单分类（`server/src/commandPolicy.ts`）：只有明确只读/测试命令自动执行，`sudo`、`bash -c`、`find -delete`、重定向、管道到 shell 等都会落入需确认，消除了旧实现的大量绕过面
 - 修改/删除确认由服务端一次性 `confirmToken` 把关（SHA-256 存储、5 分钟过期、命令内容必须匹配、用后即焚），不再信任客户端布尔标志
 - AI Agent 任务有 30 分钟 TTL、单任务并发锁、100 个任务上限和消息总量上限；模型请求有 60 秒超时，模型地址拒绝私网/本机/重定向（SSRF 防护），模型输出解析容忍代码块和前后解释文字
+- 修复 AI Agent 在 worker 已以 root 运行时命令不执行的问题：原先 root 分支写成两个独立 `if`，导致 `runAsRoot=true` 且 `getuid()==0` 时既不进 sudo 也不进普通 shell，Promise 永不返回，最终报 `parse privileged executor response`；现在用 `selectShellExecutionMode` 显式三态分流并加了回归单测
+- AI Agent 执行的命令和输出会同步到网页终端输出区（标记为 `AI $`），不再只显示在 Agent 小面板里
 - 文件写/删/移在操作前拒绝符号链接叶子并重新解析父目录真实路径，降低 TOCTOU/符号链接风险；终端面板改为固定高度，输出区可靠内滚
 - 私有存储从 SQLite 虚拟文件系统改为真实目录映射；旧虚拟 FS 的 10 个 action 及独占代码已彻底移除，仅保留一次性的 `migratePrivateWorkspace`
 - drizzle migration 包含 `service_restart_record.sql`、`workspace_items.sql` 和 `ai_provider_config.sql`，全部 `IF NOT EXISTS` 幂等

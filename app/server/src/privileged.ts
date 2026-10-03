@@ -21,6 +21,7 @@ import { exec, execFile } from "node:child_process";
 import { cpus, homedir, hostname, loadavg, platform, release, uptime, userInfo } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { definePrivilegedContracts, definePrivilegedHandlers, z } from "@hatch/space-sdk";
+import { selectShellExecutionMode } from "./shellExecution";
 
 export const privileged = definePrivilegedContracts({
   listHostDirectory: {
@@ -716,8 +717,10 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         resolvePromise({ ok: !error, stdout: cleanStdout, stderr: timedOut ? `${String(stderr)}${stderr ? "\n" : ""}命令超过 30 秒，已终止。` : String(stderr), exitCode: code, timedOut, cwd: nextCwd, durationMs: Math.max(0, Date.now() - started) });
       };
       const options = { cwd, timeout: 30000, maxBuffer: 1_000_000, env: { ...process.env, TERM: "xterm-256color" } };
-      if (args.runAsRoot && typeof process.getuid === "function" && process.getuid() !== 0) execFile("sudo", ["-n", "/bin/bash", "-c", wrappedCommand], options, onComplete);
       if (args.runAsRoot) console.warn(`[muse-audit] root shell uid=${process.getuid?.() ?? "?"} cwd=${cwd} command=${JSON.stringify(args.command.slice(0, 2000))}`);
+      const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+      const mode = selectShellExecutionMode(args.runAsRoot, uid);
+      if (mode === "sudo") execFile("sudo", ["-n", "/bin/bash", "-c", wrappedCommand], options, onComplete);
       else exec(wrappedCommand, { ...options, shell: "/bin/bash" }, onComplete);
     });
   },

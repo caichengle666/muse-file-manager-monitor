@@ -6,7 +6,7 @@
 
 跟你的 Muse 说这句话（复制粘贴）：
 
-> 帮我按照这个skill https://github.com/caichengle666/muse-file-manager-monitor/blob/main/SKILL.md 复刻一下构件就可以了
+> 按照这个skill https://github.com/caichengle666/muse-file-manager-monitor/blob/main/SKILL.md 复刻一下构件
 
 你的 Muse 会自己打开链接读 skill、拉取源码、从零构建，构建完按 skill 里的验收清单逐项验证。你不需要懂代码，也不需要手动 clone。
 

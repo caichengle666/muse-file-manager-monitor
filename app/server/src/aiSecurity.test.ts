@@ -76,6 +76,15 @@ describe("model output parsing", () => {
   test("throws on unparseable content", () => {
     expect(() => parseAiCommandContent("not json at all")).toThrow();
   });
+  test("parses the first object when the model repeats it", () => {
+    const repeated = '{"command":"uptime","explanation":"load","done":false}\n\n{"command":"uptime","explanation":"load","done":false}';
+    expect(parseAiCommandContent(repeated)).toEqual({ command: "uptime", explanation: "load", done: false });
+  });
+
+  test("parses the first object when trailing prose follows", () => {
+    const withProse = '{"command":"pwd","explanation":"show cwd","done":false}\nThis runs pwd.';
+    expect(parseAiCommandContent(withProse).command).toBe("pwd");
+  });
   test(
     "falls back to the first line of a fenced shell block", () => {
       expect(parseAiCommandContent("```bash\nls -la\necho done\n```")).toEqual({ command: "ls -la", explanation: "模型没有返回 JSON，已改用代码块中的命令。", done: false });

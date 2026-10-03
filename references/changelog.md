@@ -27,6 +27,8 @@
 - 加固模型输出解析：模型接口返回体不是合法 JSON 时给出明确错误而不是裸抛；`message.content` 同时支持字符串和分段数组两种返回形状；模型无视 JSON 约定只返回 ```bash 代码块时，回退执行代码块里的第一条命令
 - AI Agent 失败时改为返回结构化诊断（阶段 / 请求地址 / 模型名 / HTTP 状态 / 原始响应片段 / 模型返回内容），前端在对话区以卡片形式展示并可一键复制；诊断文本不再脱敏，API Key 原样显示（自用私有部署）；拉取模型和保存配置失败也不再静默，直接在对话区报原因
 - 兼容 OpenAI `tool_calls` / `function_call` 返回：请求显式声明 `bash` function tool，解析层同时支持 `content` 字符串、分段数组和工具参数；模型只回空 `{}` 参数时给出明确诊断，不再含糊报“没有返回内容”；同时修复 `runAiTask` 里空命令被误判为任务完成的问题
+- 模型把同一个 JSON 对象重复输出（`{...}\n{...}`）或 JSON 后面跟说明文字时，解析器改为提取第一个括号平衡的顶层对象，不再整段解析失败
+- AI Agent 单步模型请求超时从 20 秒放宽到 45 秒（仍低于平台网关上限），避免慢模型被过早中止
 - 文件写/删/移在操作前拒绝符号链接叶子并重新解析父目录真实路径，降低 TOCTOU/符号链接风险；终端面板改为固定高度，输出区可靠内滚
 - 私有存储从 SQLite 虚拟文件系统改为真实目录映射；旧虚拟 FS 的 10 个 action 及独占代码已彻底移除，仅保留一次性的 `migratePrivateWorkspace`
 - drizzle migration 包含 `service_restart_record.sql`、`workspace_items.sql` 和 `ai_provider_config.sql`，全部 `IF NOT EXISTS` 幂等

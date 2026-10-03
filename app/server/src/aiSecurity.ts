@@ -88,12 +88,36 @@ export function requirePublicBaseUrl(value: string): string {
   return normalized;
 }
 
+// Models sometimes repeat the JSON object or append extra text. Return the first
+// balanced top-level object so `{...}\n{...}` still parses.
+function firstJsonObject(value: string): string | null {
+  const start = value.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < value.length; index += 1) {
+    const char = value[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === "\"") inString = false;
+      continue;
+    }
+    if (char === "\"") { inString = true; continue; }
+    if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return value.slice(start, index + 1);
+    }
+  }
+  return null;
+}
+
 export function parseAiCommandContent(content: string): { command: string; explanation: string; done: boolean } {
   const normalized = content.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
-  const candidates = [normalized];
-  const objectStart = normalized.indexOf("{");
-  const objectEnd = normalized.lastIndexOf("}");
-  if (objectStart >= 0 && objectEnd > objectStart) candidates.push(normalized.slice(objectStart, objectEnd + 1));
+  const firstObject = firstJsonObject(normalized);
+  const candidates = firstObject && firstObject !== normalized ? [normalized, firstObject] : [normalized];
   for (const candidate of candidates) {
     try {
       const value: unknown = JSON.parse(candidate);

@@ -152,8 +152,14 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
   }
 }
 
-async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[], timeoutMs: number): Promise<{ command: string; explanation: string; done: boolean }> {
-  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages, tools: [{ type: "function", function: { name: "bash", description: "Run one bash command in the sandbox. Read-only commands run automatically; mutating, deleting, moving, installing or permission-changing commands pause for user confirmation. Set done=true with an empty command when the task is complete.", parameters: { type: "object", properties: { command: { type: "string", description: "The bash command to run; empty when the task is done." }, explanation: { type: "string", description: "Short explanation for this step." }, done: { type: "boolean", description: "Whether the task is complete." } }, required: ["command", "explanation", "done"], additionalProperties: false } } }] }) }, timeoutMs);
+const AI_BASH_TOOL = { type: "function", function: { name: "bash", description: "Run one bash command in the sandbox. Read-only commands run automatically; mutating, deleting, moving, installing or permission-changing commands pause for user confirmation. Set done=true with an empty command when the task is complete.", parameters: { type: "object", properties: { command: { type: "string", description: "The bash command to run; empty when the task is done." }, explanation: { type: "string", description: "Short explanation for this step." }, done: { type: "boolean", description: "Whether the task is complete." } }, required: ["command", "explanation", "done"], additionalProperties: false } } };
+
+async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[], timeoutMs: number, includeTools = true): Promise<{ command: string; explanation: string; done: boolean }> {
+  // Retries drop the tool declaration so models whose proxy mangles tool arguments
+  // are pushed back onto the plain JSON text path.
+  const payload: Record<string, unknown> = { model: config.model, temperature: 0.1, messages };
+  if (includeTools) payload.tools = [AI_BASH_TOOL];
+  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify(payload) }, timeoutMs);
   const raw = await response.text();
   const requestUrl = requirePublicBaseUrl(config.baseUrl) + "/chat/completions";
   if (!response.ok) {
@@ -418,7 +424,7 @@ export const Actions = {
         }
         let next: { command: string; explanation: string; done: boolean };
         try {
-          next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS);
+          next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS, state.emptyRetries === 0);
         } catch (error) {
           // Some OpenAI-compatible proxies return an empty tool call once and a
           // valid one on the next turn. Retry a couple of times before failing.

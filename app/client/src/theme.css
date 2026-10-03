@@ -453,6 +453,8 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .ai-terminal-heading-actions > span { color: #8fa098; font-size: 10px; }
 .ai-config-toggle { min-height: 28px; padding: 4px 9px; border: 1px solid #52665b; border-radius: 4px; background: transparent; color: #b5c3bc; font-size: 10px; cursor: pointer; }
 .ai-config-toggle:hover { border-color: #b7f34a; color: #dce8df; }
+.ai-panel-toggle { min-height: 28px; padding: 4px 9px; border: 1px solid #52665b; border-radius: 4px; background: #24322b; color: #dce8df; font-size: 10px; cursor: pointer; }
+.ai-panel-toggle:hover { border-color: #b7f34a; color: #b7f34a; }
 .ai-context-clear { min-height: 28px; padding: 4px 9px; border: 1px solid #6d4a3a; border-radius: 4px; background: transparent; color: #f0a37a; font-size: 10px; cursor: pointer; }
 .ai-context-clear:hover:not(:disabled) { border-color: #f0a37a; color: #ffd4c2; }
 .ai-context-clear:disabled { opacity: .4; cursor: not-allowed; }
@@ -525,11 +527,15 @@ button:disabled { opacity: .52; cursor: not-allowed; }
   .mode-switch { width: min(240px, 62vw); margin-left: 0; }
   .header-state { min-width: auto; }
   .content-wrap { min-height: 0; padding: 0 0 calc(88px + env(safe-area-inset-bottom)); }
-  .terminal-panel { height: auto; min-height: calc(100dvh - 68px); grid-template-rows: auto auto minmax(170px, 30dvh) minmax(260px, 1fr) auto; padding: 0 0 max(88px, calc(72px + env(safe-area-inset-bottom))); }
+  .terminal-panel { height: auto; min-height: calc(100dvh - 68px); grid-template-rows: auto auto minmax(170px, 30dvh) auto auto; padding: 0 0 max(88px, calc(72px + env(safe-area-inset-bottom))); }
   .terminal-toolbar { padding: 12px 14px; }
   .terminal-location { grid-template-columns: minmax(0, 118px) minmax(0, 1fr); }
   .terminal-output { min-height: 170px; padding: 12px; }
-  .ai-terminal-panel { min-height: 260px; padding: 12px; }
+  .ai-terminal-panel { min-height: 0; padding: 12px; }
+  .ai-terminal-panel.is-collapsed { min-height: 72px; }
+  .ai-terminal-panel.is-collapsed > :not(.ai-terminal-heading) { display: none; }
+  .ai-terminal-panel.is-expanded { position: fixed; z-index: 40; inset: 68px 0 max(0px, env(safe-area-inset-bottom)); min-height: 0; border: 1px solid #34413c; box-shadow: 0 18px 50px rgba(0,0,0,.34); }
+  .ai-terminal-panel.is-expanded .agent-chat { min-height: 0; }
   .ai-terminal-heading { gap: 8px; }
   .ai-terminal-heading-actions { flex-wrap: wrap; gap: 6px; }
   .ai-terminal-heading-actions > span { width: 100%; }

@@ -494,6 +494,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   const [agentToken, setAgentToken] = useState<string | null>(null);
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
   const [aiConfigOpen, setAiConfigOpen] = useState(false);
+  const [agentExpanded, setAgentExpanded] = useState(true);
   const [agentContextLoaded, setAgentContextLoaded] = useState(false);
   const agentStepCountRef = useRef(0);
   const outputRef = useRef<HTMLDivElement>(null);
@@ -571,10 +572,10 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   return <section className="terminal-panel" aria-label="终端">
     <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 30 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
     <div className="terminal-location"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div>
-    <div className="ai-terminal-panel">
+    <div className={`ai-terminal-panel ${agentExpanded ? "is-expanded" : "is-collapsed"}`}>
       <div className="ai-terminal-heading">
         <div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div>
-        <div className="ai-terminal-heading-actions"><span>自动读取输出并继续 · 改删操作确认</span><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>{aiConfigOpen ? "收起配置" : "模型配置"}</button></div>
+        <div className="ai-terminal-heading-actions"><span>自动读取输出并继续 · 改删操作确认</span><button type="button" className="ai-panel-toggle" onClick={() => setAgentExpanded((expanded) => !expanded)} aria-expanded={agentExpanded}>{agentExpanded ? "收起对话" : "展开对话"}</button><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>{aiConfigOpen ? "收起配置" : "模型配置"}</button></div>
       </div>
       {aiConfigOpen && <div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="text" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder="API Key" /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiApiKey.trim()}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiApiKey.trim() || !aiModel.trim()}>保存配置</button></div>}
       <div className="agent-chat" ref={chatRef} role="log" aria-live="polite">

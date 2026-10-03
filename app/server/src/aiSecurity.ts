@@ -13,6 +13,40 @@ export const AI_REQUEST_TIMEOUT_MS = 60_000;
 // at a time and asks the model with a tighter timeout than plain model listing.
 export const AI_AGENT_REQUEST_TIMEOUT_MS = 20_000;
 
+/**
+ * Structured failure details for the AI terminal. The UI shows these verbatim so a
+ * failing request can be diagnosed without digging through sandbox logs.
+ */
+export type AiDiagnostic = {
+  phase: "request" | "http" | "response-json" | "model-json" | "shell";
+  url: string;
+  status: number | null;
+  model: string;
+  detail: string;
+  responseSnippet: string;
+  contentSnippet: string;
+};
+
+const SECRET_PATTERN = /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b/g;
+
+export function redactSecrets(value: string): string {
+  return value.replace(SECRET_PATTERN, "[redacted-key]");
+}
+
+export class AiRequestError extends Error {
+  readonly diagnostic: AiDiagnostic;
+
+  constructor(message: string, diagnostic: AiDiagnostic) {
+    super(message);
+    this.name = "AiRequestError";
+    this.diagnostic = diagnostic;
+  }
+}
+
+export function describeAiError(error: unknown): AiDiagnostic | null {
+  return error instanceof AiRequestError ? error.diagnostic : null;
+}
+
 export function randomToken(): string {
   return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
 }

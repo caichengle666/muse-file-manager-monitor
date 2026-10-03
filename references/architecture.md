@@ -39,6 +39,7 @@
 - **AI 接口防护**：模型 base URL 必须公网 http(s)（拒绝 localhost/私网/链路本地/.local），请求 60 秒超时且禁止重定向；API Key 明文存 SQLite，请把 `app.db` 当密钥文件保护。
 - **Agent 调用模型**：`runAiTask` 每次调用只做一件事——要么问模型要下一步命令（20 秒超时），要么执行已排队的命令；多步循环由前端反复调用驱动。这样单个平台请求始终短于网关等待上限，避免 `Gateway request timed out: spaces.cvm.post`。
 - **模型输出解析**：`message.content` 兼容字符串与分段数组两种形状；返回体不是合法 JSON 时报明确错误；模型若只返回 ```bash 代码块，则回退执行代码块首条命令。
+- **失败诊断**：模型调用失败时抛出 `AiRequestError`，携带阶段（request / http / response-json / model-json）、请求 URL、模型名、HTTP 状态、原始响应片段和模型返回内容；`runAiTask` 通过 `diagnostic` 字段返回给前端，对话区展示为可复制卡片。文本经 `redactSecrets` 脱敏密钥。新增 `AiDiagnostic`、`AiRequestError`、`describeAiError`、`redactSecrets` 均在 `server/src/aiSecurity.ts`。
 - **Agent 状态**：任务内存态，30 分钟 TTL、单任务并发锁、最多 100 个任务、消息总量上限 120k 字符；服务重启会丢任务。
 - **文件变更 TOCTOU**：写/删/移前拒绝符号链接叶子并重新解析父目录真实路径；但路径解析与系统调用之间仍不是原子的，高并发本机改动仍有理论窗口。
 

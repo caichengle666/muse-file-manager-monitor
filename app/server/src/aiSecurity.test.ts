@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { constantTimeEqual, digestToken, extractAiContent, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, redactSecrets, requirePublicBaseUrl } from "./aiSecurity";
 
 describe("SSRF guard", () => {
   test("accepts public OpenAI-compatible hosts", () => {
@@ -84,6 +84,19 @@ describe("model output parsing", () => {
 });
 
 describe("model content extraction", () => {
+describe("error diagnostics", () => {
+  test("redacts api keys from reported text", () => {
+    expect(redactSecrets('auth failed for sk-abcdef1234567890')).toBe("auth failed for [redacted-key]");
+  });
+
+  test("returns diagnostics only for AiRequestError", () => {
+    const diagnostic = { phase: "http" as const, url: "https://example.com/v1/chat/completions", status: 404, model: "gpt-4o", detail: "not found", responseSnippet: "{}", contentSnippet: "" };
+    expect(describeAiError(new AiRequestError("boom", diagnostic))).toEqual(diagnostic);
+    expect(describeAiError(new Error("boom"))).toBeNull();
+    expect(describeAiError("boom")).toBeNull();
+  });
+});
+
   test("accepts a plain string", () => {
     expect(extractAiContent('{"command":"pwd"}')).toBe('{"command":"pwd"}');
   });

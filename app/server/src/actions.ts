@@ -1,5 +1,5 @@
 import { defineAction, z, type ActionsModule, type SpaceDb } from "@hatch/space-sdk";
-import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, constantTimeEqual, digestToken, extractAiContent, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiRequestError, type AiDiagnostic, constantTimeEqual, describeAiError, digestToken, extractAiContent, parseAiCommandContent, randomToken, redactSecrets, requirePublicBaseUrl } from "./aiSecurity";
 import { and, eq, sql } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import { assessCommand } from "./commandPolicy";
@@ -81,20 +81,25 @@ async function readAiConfig(db: Db): Promise<typeof schema.aiProviderConfig.$inf
   return config ?? null;
 }
 
+function aiDiagnostic(phase: AiDiagnostic["phase"], url: string, model: string, detail: string, extra?: { status?: number | null; responseSnippet?: string; contentSnippet?: string }): AiDiagnostic {
+  return { phase, url, model, detail, status: extra?.status ?? null, responseSnippet: redactSecrets(extra?.responseSnippet ?? ""), contentSnippet: redactSecrets(extra?.contentSnippet ?? "") };
+}
+
 async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path: string, init?: RequestInit, timeoutMs = AI_REQUEST_TIMEOUT_MS): Promise<Response> {
   const baseUrl = requirePublicBaseUrl(config.baseUrl);
+  const url = `${baseUrl}${path}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(`${baseUrl}${path}`, {
+    return await fetch(url, {
       ...init,
       signal: controller.signal,
       redirect: "error",
       headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", ...(init?.headers ?? {}) },
     });
   } catch (error) {
-    if (controller.signal.aborted) throw new Error(`模型接口超过 ${timeoutMs / 1000} 秒未响应，已中止。`);
-    throw error;
+    const reason = controller.signal.aborted ? `请求超过 ${timeoutMs / 1000} 秒未响应，已中止` : error instanceof Error ? error.message : "未知网络错误";
+    throw new AiRequestError(`模型请求失败：${reason}`, aiDiagnostic("request", url, config.model, reason));
   } finally {
     clearTimeout(timer);
   }
@@ -149,15 +154,26 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
 async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[], timeoutMs: number): Promise<{ command: string; explanation: string; done: boolean }> {
   const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages }) }, timeoutMs);
   const raw = await response.text();
-  if (!response.ok) throw new Error(`模型接口 ${response.status}: ${raw.slice(0, 500)}`);
+  const requestUrl = requirePublicBaseUrl(config.baseUrl) + "/chat/completions";
+  if (!response.ok) {
+    const snippet = raw.slice(0, 800);
+    throw new AiRequestError(`模型接口返回 HTTP ${response.status}`, aiDiagnostic("http", requestUrl, config.model, `服务端拒绝了这次对话请求（HTTP ${response.status}）。常见原因：模型名不可用、该模型不支持对话接口、余额或额度不足、API Key 没有该模型权限。`, { status: response.status, responseSnippet: snippet }));
+  }
   let body: { choices?: Array<{ message?: { content?: unknown } }> };
   try {
     body = JSON.parse(raw) as typeof body;
   } catch {
-    throw new Error(`模型接口返回的不是合法 JSON：${raw.slice(0, 300)}`);
+    throw new AiRequestError("模型接口返回的不是合法 JSON", aiDiagnostic("response-json", requestUrl, config.model, "接口返回了非 JSON 内容，可能是中转站错误页或网关拦截页。", { status: response.status, responseSnippet: raw.slice(0, 800) }));
   }
-  const content = extractAiContent(body.choices?.[0]?.message?.content) || "{}";
-  return parseAiCommandContent(content);
+  const content = extractAiContent(body.choices?.[0]?.message?.content);
+  if (!content) {
+    throw new AiRequestError("模型没有返回内容", aiDiagnostic("model-json", requestUrl, config.model, "接口调用成功，但 choices[0].message.content 为空。可能是模型名不对、被内容策略拦截，或返回了非标准的流式结构。", { status: response.status, responseSnippet: raw.slice(0, 800) }));
+  }
+  try {
+    return parseAiCommandContent(content);
+  } catch (error) {
+    throw new AiRequestError(error instanceof Error ? error.message : "模型输出无法解析", aiDiagnostic("model-json", requestUrl, config.model, "模型没有按要求返回 JSON，也无法从代码块中提取命令。可以在模型配置里换一个指令遵循能力更强的模型。", { status: response.status, responseSnippet: raw.slice(0, 800), contentSnippet: content.slice(0, 800) }));
+  }
 }
 
 export const Actions = {
@@ -345,6 +361,7 @@ export const Actions = {
   runAiTask: defineAction({
     request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), confirmToken: z.string().max(128).nullable().default(null) }),
     response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable(), confirmToken: z.string().nullable() }),
+    response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable(), confirmToken: z.string().nullable(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable() }),
     privileged: [privileged.executeShell],
     async handler(ctx, args) {
       pruneAiTasks();
@@ -353,14 +370,14 @@ export const Actions = {
       // timeout ("Gateway request timed out"), so the client re-invokes this action
       // with the same taskId until the task completes.
       const config = await readAiConfig(ctx.db<typeof schema>());
-      if (!config) return { ok: false, taskId: args.taskId ?? crypto.randomUUID(), status: "failed" as const, message: "请先配置 AI 服务。", steps: [], pendingCommand: null, confirmToken: null };
+      if (!config) return { ok: false, taskId: args.taskId ?? crypto.randomUUID(), status: "failed" as const, message: "请先配置 AI 服务。", steps: [], pendingCommand: null, confirmToken: null, diagnostic: null };
       const owner = "default";
       const taskId = args.taskId ?? crypto.randomUUID();
       let state = args.taskId ? aiTasks.get(args.taskId) : undefined;
       if (state && (state.owner !== owner || state.configId !== config.id)) {
-        return { ok: false, taskId, status: "failed" as const, message: "任务不存在、已过期，或模型配置已变更，请重新发起。", steps: [], pendingCommand: null, confirmToken: null };
+        return { ok: false, taskId, status: "failed" as const, message: "任务不存在、已过期，或模型配置已变更，请重新发起。", steps: [], pendingCommand: null, confirmToken: null, diagnostic: null };
       }
-      if (state?.busy) return { ok: false, taskId, status: "running" as const, message: "任务正在执行，请等待当前步骤完成。", steps: state.steps, pendingCommand: state.pendingCommand || null, confirmToken: null };
+      if (state?.busy) return { ok: false, taskId, status: "running" as const, message: "任务正在执行，请等待当前步骤完成。", steps: state.steps, pendingCommand: state.pendingCommand || null, confirmToken: null, diagnostic: null };
       if (!state) {
         state = { configId: config.id, owner, root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, steps: [], busy: false, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。只读、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
         aiTasks.set(taskId, state);
@@ -378,7 +395,7 @@ export const Actions = {
           if (!isAutoRun) {
             const providedHash = args.confirmToken ? digestToken(args.confirmToken) : "";
             if (!state.pendingTokenHash || !providedHash || !constantTimeEqual(providedHash, state.pendingTokenHash)) {
-              return { ok: true, taskId, status: "waiting_confirmation" as const, message: "这一步需要用户确认后才能执行。", steps: state.steps, pendingCommand: state.pendingCommand, confirmToken: null };
+              return { ok: true, taskId, status: "waiting_confirmation" as const, message: "这一步需要用户确认后才能执行。", steps: state.steps, pendingCommand: state.pendingCommand, confirmToken: null, diagnostic: null };
             }
           }
           const queuedCommand = state.pendingCommand;
@@ -390,10 +407,10 @@ export const Actions = {
           state.cwd = result.cwd;
           state.steps.push({ command: queuedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: !isAutoRun });
           pushAiMessage(state, { role: "user", content: `命令：${queuedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
-          return { ok: true, taskId, status: "running" as const, message: "命令已执行，继续下一步。", steps: state.steps, pendingCommand: null, confirmToken: null };
+          return { ok: true, taskId, status: "running" as const, message: "命令已执行，继续下一步。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
         }
         const next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS);
-        if (next.done || !next.command) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null }; }
+        if (next.done || !next.command) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null }; }
         const assessment = assessCommand(next.command);
         pushAiMessage(state, { role: "assistant", content: JSON.stringify(next) });
         state.pendingCommand = next.command;
@@ -401,14 +418,14 @@ export const Actions = {
           const token = randomToken();
           state.pendingTokenHash = digestToken(token);
           state.pendingAutoRun = false;
-          return { ok: true, taskId, status: "waiting_confirmation" as const, message: next.explanation || `这一步需要确认：${assessment.reason}`, steps: state.steps, pendingCommand: next.command, confirmToken: token };
+          return { ok: true, taskId, status: "waiting_confirmation" as const, message: next.explanation || `这一步需要确认：${assessment.reason}`, steps: state.steps, pendingCommand: next.command, confirmToken: token, diagnostic: null };
         }
         state.pendingTokenHash = null;
         state.pendingAutoRun = true;
-        return { ok: true, taskId, status: "running" as const, message: next.explanation || "准备执行命令。", steps: state.steps, pendingCommand: next.command, confirmToken: null };
+        return { ok: true, taskId, status: "running" as const, message: next.explanation || "准备执行命令。", steps: state.steps, pendingCommand: next.command, confirmToken: null, diagnostic: null };
       } catch (error) {
         aiTasks.delete(taskId);
-        return { ok: false, taskId, status: "failed" as const, message: `AI Agent 执行失败：${error instanceof Error ? error.message : "未知错误"}`, steps: state.steps, pendingCommand: null, confirmToken: null };
+        return { ok: false, taskId, status: "failed" as const, message: `AI Agent 执行失败：${error instanceof Error ? error.message : "未知错误"}`, steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: describeAiError(error) };
       } finally {
         state.busy = false;
         state.updatedAt = Date.now();

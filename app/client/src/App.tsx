@@ -29,7 +29,8 @@ type HostDialog =
   | null;
 type TerminalEntry = { command: string; stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; cwd: string; durationMs: number; source?: "shell" | "agent" };
 type AgentStep = { command: string; stdout: string; stderr: string; cwd: string; exitCode: number | null; requiresConfirmation: boolean };
-type AgentMessage = { role: "user" | "assistant"; text: string; steps?: AgentStep[] };
+type AgentDiagnostic = { phase: string; url: string; status: number | null; model: string; detail: string; responseSnippet: string; contentSnippet: string };
+type AgentMessage = { role: "user" | "assistant"; text: string; steps?: AgentStep[]; diagnostic?: AgentDiagnostic | null };
 type MonitorHistory = { time: string; cpu: number; memory: number; rx: number; tx: number; [key: string]: string | number };
 type DirectoryUsage = { name: string; path: string; size: number; timedOut: boolean };
 type ImageViewerState = {
@@ -500,8 +501,28 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight }); }, [agentMessages, aiBusy]);
   useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiModel(result.model); setAiConfigured(result.configured); setAiConfigOpen(!result.configured); }); }, []);
   function submit(event: FormEvent) { event.preventDefault(); const value = command.trim(); if (!value || busy) return; setCommand(""); void onRun(value, root, path); }
-  async function saveAi() { if (!aiApiKey.trim() || !aiModel.trim()) return; setAiBusy(true); try { const result = await api.saveAiProviderConfig({ baseUrl: aiBaseUrl, apiKey: aiApiKey, model: aiModel }); setAiConfigured(result.ok); } finally { setAiBusy(false); } }
-  async function pullModels() { if (!aiApiKey.trim()) return; setAiBusy(true); try { const result = await api.listAiModels({ baseUrl: aiBaseUrl, apiKey: aiApiKey }); setAiModels(result.models); } finally { setAiBusy(false); } }
+  async function saveAi() {
+    if (!aiApiKey.trim() || !aiModel.trim()) return;
+    setAiBusy(true);
+    try {
+      const result = await api.saveAiProviderConfig({ baseUrl: aiBaseUrl, apiKey: aiApiKey, model: aiModel });
+      setAiConfigured(result.ok);
+      appendAgentMessage({ role: "assistant", text: result.ok ? "模型配置已保存到服务器。" : `保存配置失败：${result.message}` });
+    } catch (error) {
+      appendAgentMessage({ role: "assistant", text: `保存配置失败：${error instanceof Error ? error.message : "未知错误"}` });
+    } finally { setAiBusy(false); }
+  }
+  async function pullModels() {
+    if (!aiApiKey.trim()) return;
+    setAiBusy(true);
+    try {
+      const result = await api.listAiModels({ baseUrl: aiBaseUrl, apiKey: aiApiKey });
+      setAiModels(result.models);
+      if (!result.ok || !result.models.length) appendAgentMessage({ role: "assistant", text: `拉取模型失败：${result.message || "接口没有返回可用模型"}` });
+    } catch (error) {
+      appendAgentMessage({ role: "assistant", text: `拉取模型失败：${error instanceof Error ? error.message : "未知错误"}` });
+    } finally { setAiBusy(false); }
+  }
   function appendAgentMessage(message: AgentMessage) { setAgentMessages((current) => [...current, message].slice(-40)); }
   async function runAgent(confirmToken?: string) {
     const task = agentPrompt.trim();
@@ -522,7 +543,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
         setAgentTaskId(activeTaskId);
         setAgentPending(result.status === "waiting_confirmation" ? result.pendingCommand ?? "" : "");
         setAgentToken(result.confirmToken ?? null);
-        if (newSteps.length > 0 || result.status !== "running") appendAgentMessage({ role: "assistant", text: result.message || (result.status === "completed" ? "任务已完成。" : ""), steps: newSteps });
+        if (newSteps.length > 0 || result.status !== "running") appendAgentMessage({ role: "assistant", text: result.message || (result.status === "completed" ? "任务已完成。" : ""), steps: newSteps, diagnostic: result.diagnostic ?? null });
         onAgentSteps(result.steps);
         nextToken = null;
         if (result.status === "completed" || result.status === "failed") { setAgentPrompt(""); setAgentToken(null); agentStepCountRef.current = 0; break; }
@@ -547,6 +568,16 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
           <div className="agent-message-role">{message.role === "user" ? "你" : "AI"}</div>
           {message.text && <div className="agent-message-text">{message.text}</div>}
           {message.steps && message.steps.length > 0 && <div className="agent-message-steps">{message.steps.map((step, stepIndex) => <div key={`${step.command}-${stepIndex}`}><code>$ {step.command}</code>{step.stdout && <pre>{step.stdout}</pre>}{step.stderr && <pre className="stderr">{step.stderr}</pre>}<small>退出 {step.exitCode ?? "未知"} · {step.cwd || "?"}</small></div>)}</div>}
+          {message.diagnostic && <div className="agent-diagnostic">
+            <div className="agent-diagnostic-row"><span>阶段</span><code>{message.diagnostic.phase}</code></div>
+            <div className="agent-diagnostic-row"><span>地址</span><code>{message.diagnostic.url}</code></div>
+            <div className="agent-diagnostic-row"><span>模型</span><code>{message.diagnostic.model}</code></div>
+            <div className="agent-diagnostic-row"><span>状态</span><code>{message.diagnostic.status ?? "无响应"}</code></div>
+            <p>{message.diagnostic.detail}</p>
+            {message.diagnostic.contentSnippet && <><label>模型返回内容</label><pre>{message.diagnostic.contentSnippet}</pre></>}
+            {message.diagnostic.responseSnippet && <><label>原始响应</label><pre>{message.diagnostic.responseSnippet}</pre></>}
+            <button type="button" onClick={() => void navigator.clipboard?.writeText(JSON.stringify(message.diagnostic, null, 2))}>复制诊断信息</button>
+          </div>}
         </div>)}
         {aiBusy && <div className="agent-message assistant pending"><div className="agent-message-role">AI</div><div className="agent-message-text">正在思考并执行下一步…</div></div>}
       </div>

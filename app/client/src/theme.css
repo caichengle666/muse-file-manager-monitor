@@ -467,6 +467,14 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .agent-message-steps pre { max-height: 180px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #c7d5ce; font: 10px/1.5 "IBM Plex Mono", ui-monospace, monospace; }
 .agent-message-steps pre.stderr { color: #f0a37a; }
 .agent-message-steps small { color: #8fa098; font-size: 9px; }
+.agent-diagnostic { display: grid; gap: 5px; margin-top: 4px; padding: 9px 10px; border: 1px solid #6d4a3a; border-left: 3px solid #f0a37a; border-radius: 6px; background: #1a1310; }
+.agent-diagnostic-row { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.agent-diagnostic-row span { color: #b08a78; font-size: 9px; }
+.agent-diagnostic-row code { overflow-wrap: anywhere; color: #f3c9b2; font: 10px/1.5 "IBM Plex Mono", ui-monospace, monospace; }
+.agent-diagnostic p { margin: 2px 0 0; color: #e8cdbf; font-size: 10px; line-height: 1.55; }
+.agent-diagnostic label { margin-top: 3px; color: #b08a78; font-size: 9px; }
+.agent-diagnostic pre { max-height: 160px; margin: 0; overflow: auto; padding: 7px 8px; background: #0b0908; color: #d8c3b8; font: 10px/1.5 "IBM Plex Mono", ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-diagnostic button { justify-self: start; margin-top: 3px; padding: 5px 9px; border: 1px solid #6d4a3a; border-radius: 4px; background: transparent; color: #f3c9b2; font-size: 10px; cursor: pointer; }
 .ai-terminal-config, .ai-terminal-prompt { display: grid; grid-template-columns: minmax(160px, 1.4fr) minmax(130px, 1fr) minmax(120px, .8fr) auto auto; gap: 7px; }
 .ai-terminal-prompt { grid-template-columns: minmax(0, 1fr) auto; }
 .ai-terminal-config input, .ai-terminal-config select, .ai-terminal-prompt input { min-width: 0; height: 34px; padding: 6px 8px; border: 1px solid #42534c; border-radius: 4px; background: #0d1411; color: #dce8df; font: 10px/1.2 "IBM Plex Mono", ui-monospace, monospace; }

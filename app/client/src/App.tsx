@@ -508,16 +508,26 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
     if (!task && !agentTaskId) return;
     if (!confirmToken && task) appendAgentMessage({ role: "user", text: task });
     setAiBusy(true);
+    let activeTaskId = agentTaskId;
+    let nextToken = confirmToken ?? null;
     try {
-      const result = await api.runAiTask({ taskId: agentTaskId, prompt: task || "继续当前任务", root, path, confirmToken: confirmToken ?? null, maxSteps: 20 });
-      const newSteps = result.steps.slice(agentStepCountRef.current);
-      agentStepCountRef.current = result.steps.length;
-      setAgentTaskId(result.status === "completed" || result.status === "failed" ? null : result.taskId);
-      setAgentPending(result.pendingCommand ?? "");
-      setAgentToken(result.confirmToken ?? null);
-      appendAgentMessage({ role: "assistant", text: result.message || (result.status === "completed" ? "任务已完成。" : ""), steps: newSteps });
-      onAgentSteps(result.steps);
-      if (result.status === "completed" || result.status === "failed") { setAgentPrompt(""); setAgentToken(null); agentStepCountRef.current = 0; }
+      // Each server call handles exactly one model turn or one command, so the
+      // gateway never sees a multi-minute request. Keep driving the loop here until
+      // the task finishes or needs user confirmation.
+      for (let round = 0; round < 40; round += 1) {
+        const result = await api.runAiTask({ taskId: activeTaskId, prompt: task || "继续当前任务", root, path, confirmToken: nextToken });
+        const newSteps = result.steps.slice(agentStepCountRef.current);
+        agentStepCountRef.current = result.steps.length;
+        activeTaskId = result.status === "completed" || result.status === "failed" ? null : result.taskId;
+        setAgentTaskId(activeTaskId);
+        setAgentPending(result.status === "waiting_confirmation" ? result.pendingCommand ?? "" : "");
+        setAgentToken(result.confirmToken ?? null);
+        if (newSteps.length > 0 || result.status !== "running") appendAgentMessage({ role: "assistant", text: result.message || (result.status === "completed" ? "任务已完成。" : ""), steps: newSteps });
+        onAgentSteps(result.steps);
+        nextToken = null;
+        if (result.status === "completed" || result.status === "failed") { setAgentPrompt(""); setAgentToken(null); agentStepCountRef.current = 0; break; }
+        if (result.status === "waiting_confirmation") break;
+      }
     } catch (error) {
       appendAgentMessage({ role: "assistant", text: `请求失败：${error instanceof Error ? error.message : "未知错误"}` });
     } finally { setAiBusy(false); }

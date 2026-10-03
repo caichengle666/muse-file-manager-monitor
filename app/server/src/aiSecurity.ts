@@ -8,6 +8,10 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
 export const AI_REQUEST_TIMEOUT_MS = 60_000;
+// Agent steps run inside one platform action call. Keep each call short so the
+// gateway never sees a multi-minute request: the client drives the loop one step
+// at a time and asks the model with a tighter timeout than plain model listing.
+export const AI_AGENT_REQUEST_TIMEOUT_MS = 20_000;
 
 export function randomToken(): string {
   return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
@@ -71,5 +75,24 @@ export function parseAiCommandContent(content: string): { command: string; expla
       }
     } catch { /* try the next candidate */ }
   }
+  // Last resort: some models ignore the JSON contract and answer with a fenced
+  // shell block. Run its first command instead of failing the whole task.
+  const fenced = /```(?:bash|sh|shell)?\s*\n([\s\S]*?)```/i.exec(content);
+  const fallback = fenced?.[1]?.split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("#"));
+  if (fallback) return { command: fallback, explanation: "模型没有返回 JSON，已改用代码块中的命令。", done: false };
   throw new Error("模型没有返回可解析的 JSON。");
+}
+
+// OpenAI-compatible providers may return message.content as a plain string or as
+// an array of typed parts; both shapes must survive JSON parsing.
+export function extractAiContent(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map((part) => {
+      if (typeof part === "string") return part;
+      if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") return (part as { text: string }).text;
+      return "";
+    }).join("");
+  }
+  return "";
 }

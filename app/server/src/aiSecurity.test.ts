@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { constantTimeEqual, digestToken, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { constantTimeEqual, digestToken, extractAiContent, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
 
 describe("SSRF guard", () => {
   test("accepts public OpenAI-compatible hosts", () => {
@@ -75,5 +75,26 @@ describe("model output parsing", () => {
 
   test("throws on unparseable content", () => {
     expect(() => parseAiCommandContent("not json at all")).toThrow();
+  });
+  test(
+    "falls back to the first line of a fenced shell block", () => {
+      expect(parseAiCommandContent("```bash\nls -la\necho done\n```")).toEqual({ command: "ls -la", explanation: "模型没有返回 JSON，已改用代码块中的命令。", done: false });
+    },
+  );
+});
+
+describe("model content extraction", () => {
+  test("accepts a plain string", () => {
+    expect(extractAiContent('{"command":"pwd"}')).toBe('{"command":"pwd"}');
+  });
+
+  test("joins typed content parts", () => {
+    expect(extractAiContent([{ type: "text", text: '{"command":' }, { type: "text", text: '"pwd"}' }])).toBe('{"command":"pwd"}');
+  });
+
+  test("returns empty for missing content", () => {
+    expect(extractAiContent(undefined)).toBe("");
+    expect(extractAiContent(null)).toBe("");
+    expect(extractAiContent(42)).toBe("");
   });
 });

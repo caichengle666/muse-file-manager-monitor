@@ -1,5 +1,5 @@
 import { defineAction, z, type ActionsModule, type SpaceDb } from "@hatch/space-sdk";
-import { AI_REQUEST_TIMEOUT_MS, constantTimeEqual, digestToken, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, constantTimeEqual, digestToken, extractAiContent, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
 import { and, eq, sql } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import { assessCommand } from "./commandPolicy";
@@ -81,10 +81,10 @@ async function readAiConfig(db: Db): Promise<typeof schema.aiProviderConfig.$inf
   return config ?? null;
 }
 
-async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path: string, init?: RequestInit): Promise<Response> {
+async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path: string, init?: RequestInit, timeoutMs = AI_REQUEST_TIMEOUT_MS): Promise<Response> {
   const baseUrl = requirePublicBaseUrl(config.baseUrl);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(`${baseUrl}${path}`, {
       ...init,
@@ -93,7 +93,7 @@ async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path
       headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", ...(init?.headers ?? {}) },
     });
   } catch (error) {
-    if (controller.signal.aborted) throw new Error(`模型接口超过 ${AI_REQUEST_TIMEOUT_MS / 1000} 秒未响应，已中止。`);
+    if (controller.signal.aborted) throw new Error(`模型接口超过 ${timeoutMs / 1000} 秒未响应，已中止。`);
     throw error;
   } finally {
     clearTimeout(timer);
@@ -112,6 +112,7 @@ type AiTaskState = {
   messages: AiTaskMessage[];
   pendingCommand: string;
   pendingTokenHash: string | null;
+  pendingAutoRun: boolean;
   steps: AiTaskStep[];
   busy: boolean;
   updatedAt: number;
@@ -145,12 +146,17 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
   }
 }
 
-async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[]): Promise<{ command: string; explanation: string; done: boolean }> {
-  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages }) });
+async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[], timeoutMs: number): Promise<{ command: string; explanation: string; done: boolean }> {
+  const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages }) }, timeoutMs);
   const raw = await response.text();
   if (!response.ok) throw new Error(`模型接口 ${response.status}: ${raw.slice(0, 500)}`);
-  const body = JSON.parse(raw) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = body.choices?.[0]?.message?.content ?? "{}";
+  let body: { choices?: Array<{ message?: { content?: unknown } }> };
+  try {
+    body = JSON.parse(raw) as typeof body;
+  } catch {
+    throw new Error(`模型接口返回的不是合法 JSON：${raw.slice(0, 300)}`);
+  }
+  const content = extractAiContent(body.choices?.[0]?.message?.content) || "{}";
   return parseAiCommandContent(content);
 }
 
@@ -337,11 +343,15 @@ export const Actions = {
   }),
 
   runAiTask: defineAction({
-    request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), confirmToken: z.string().max(128).nullable().default(null), maxSteps: z.number().int().min(1).max(30).default(20) }),
+    request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), confirmToken: z.string().max(128).nullable().default(null) }),
     response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable(), confirmToken: z.string().nullable() }),
     privileged: [privileged.executeShell],
     async handler(ctx, args) {
       pruneAiTasks();
+      // One call performs at most one model turn plus one command. A multi-step
+      // agent loop inside a single request would exceed the platform gateway
+      // timeout ("Gateway request timed out"), so the client re-invokes this action
+      // with the same taskId until the task completes.
       const config = await readAiConfig(ctx.db<typeof schema>());
       if (!config) return { ok: false, taskId: args.taskId ?? crypto.randomUUID(), status: "failed" as const, message: "请先配置 AI 服务。", steps: [], pendingCommand: null, confirmToken: null };
       const owner = "default";
@@ -352,44 +362,50 @@ export const Actions = {
       }
       if (state?.busy) return { ok: false, taskId, status: "running" as const, message: "任务正在执行，请等待当前步骤完成。", steps: state.steps, pendingCommand: state.pendingCommand || null, confirmToken: null };
       if (!state) {
-        state = { configId: config.id, owner, root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, steps: [], busy: false, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。只读、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
+        state = { configId: config.id, owner, root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, steps: [], busy: false, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。只读、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
         aiTasks.set(taskId, state);
         pruneAiTasks();
       }
       state.busy = true;
       state.updatedAt = Date.now();
       try {
+        // Each call does exactly one thing: run the queued command, or ask the model
+        // for the next one. Keeping the two apart caps a request at the model timeout
+        // or the shell timeout instead of their sum, so the platform gateway does not
+        // abort it with "Gateway request timed out".
         if (state.pendingCommand) {
-          const providedHash = args.confirmToken ? digestToken(args.confirmToken) : "";
-          if (!state.pendingTokenHash || !providedHash || !constantTimeEqual(providedHash, state.pendingTokenHash)) {
-            return { ok: true, taskId, status: "waiting_confirmation" as const, message: "这一步需要用户确认后才能执行。", steps: state.steps, pendingCommand: state.pendingCommand, confirmToken: null };
+          const isAutoRun = state.pendingAutoRun;
+          if (!isAutoRun) {
+            const providedHash = args.confirmToken ? digestToken(args.confirmToken) : "";
+            if (!state.pendingTokenHash || !providedHash || !constantTimeEqual(providedHash, state.pendingTokenHash)) {
+              return { ok: true, taskId, status: "waiting_confirmation" as const, message: "这一步需要用户确认后才能执行。", steps: state.steps, pendingCommand: state.pendingCommand, confirmToken: null };
+            }
           }
-          const confirmedCommand = state.pendingCommand;
-          pushAiMessage(state, { role: "user", content: `用户已确认执行待执行命令：${confirmedCommand}` });
+          const queuedCommand = state.pendingCommand;
           state.pendingCommand = "";
           state.pendingTokenHash = null;
-          const result = await ctx.executePrivileged(privileged.executeShell, { command: confirmedCommand, root: state.root, path: state.path, cwd: state.cwd, runAsRoot: state.runAsRoot });
+          state.pendingAutoRun = false;
+          pushAiMessage(state, { role: "user", content: isAutoRun ? `执行命令：${queuedCommand}` : `用户已确认执行待执行命令：${queuedCommand}` });
+          const result = await ctx.executePrivileged(privileged.executeShell, { command: queuedCommand, root: state.root, path: state.path, cwd: state.cwd, runAsRoot: state.runAsRoot });
           state.cwd = result.cwd;
-          state.steps.push({ command: confirmedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: true });
-          pushAiMessage(state, { role: "user", content: `命令：${confirmedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
+          state.steps.push({ command: queuedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: !isAutoRun });
+          pushAiMessage(state, { role: "user", content: `命令：${queuedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
+          return { ok: true, taskId, status: "running" as const, message: "命令已执行，继续下一步。", steps: state.steps, pendingCommand: null, confirmToken: null };
         }
-        for (let step = 0; step < args.maxSteps; step += 1) {
-          const next = await requestNextAiCommand(config, state.messages);
-          if (next.done || !next.command) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null }; }
-          const assessment = assessCommand(next.command);
-          pushAiMessage(state, { role: "assistant", content: JSON.stringify(next) });
-          if (assessment.requiresConfirmation) {
-            const token = randomToken();
-            state.pendingCommand = next.command;
-            state.pendingTokenHash = digestToken(token);
-            return { ok: true, taskId, status: "waiting_confirmation" as const, message: next.explanation || `这一步需要确认：${assessment.reason}`, steps: state.steps, pendingCommand: next.command, confirmToken: token };
-          }
-          const result = await ctx.executePrivileged(privileged.executeShell, { command: next.command, root: state.root, path: state.path, cwd: state.cwd, runAsRoot: state.runAsRoot });
-          state.cwd = result.cwd;
-          state.steps.push({ command: next.command, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: false });
-          pushAiMessage(state, { role: "user", content: `命令：${next.command}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
+        const next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS);
+        if (next.done || !next.command) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null }; }
+        const assessment = assessCommand(next.command);
+        pushAiMessage(state, { role: "assistant", content: JSON.stringify(next) });
+        state.pendingCommand = next.command;
+        if (assessment.requiresConfirmation) {
+          const token = randomToken();
+          state.pendingTokenHash = digestToken(token);
+          state.pendingAutoRun = false;
+          return { ok: true, taskId, status: "waiting_confirmation" as const, message: next.explanation || `这一步需要确认：${assessment.reason}`, steps: state.steps, pendingCommand: next.command, confirmToken: token };
         }
-        return { ok: true, taskId, status: "running" as const, message: "已达到本轮步数上限，可继续运行任务。", steps: state.steps, pendingCommand: null, confirmToken: null };
+        state.pendingTokenHash = null;
+        state.pendingAutoRun = true;
+        return { ok: true, taskId, status: "running" as const, message: next.explanation || "准备执行命令。", steps: state.steps, pendingCommand: next.command, confirmToken: null };
       } catch (error) {
         aiTasks.delete(taskId);
         return { ok: false, taskId, status: "failed" as const, message: `AI Agent 执行失败：${error instanceof Error ? error.message : "未知错误"}`, steps: state.steps, pendingCommand: null, confirmToken: null };

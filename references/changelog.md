@@ -14,9 +14,9 @@
 - 每个挂载点独立容量（`/`、`/home/hatch`、`/tmp`）、磁盘 I/O 速率、每核 CPU 曲线、1/5/15 分钟负载、内存细分（已用/缓存/缓冲）、按网卡拆分的上下行速率、Top 进程（按 CPU/内存排序）、主机信息（内核/主机名/启动时间）
 - `/home/hatch` 一级目录占用排行（手动扫描按钮，不进轮询）；服务重启记录（累计次数、上次重启时间、本次启动时间，持久化）
 
-**终端页签**：网页里执行 shell 命令（单次 5 秒超时）。RCE 级能力，只用于完全控制的私有部署。
+**终端页签与 AI Agent**：网页里执行 shell 命令（单次 30 秒超时）；可配置外部 OpenAI-compatible API、拉取模型，并让 AI 按“生成命令 → 执行 → 读取 stdout/stderr → 继续下一步”的循环完成最多 20 步任务。读取类命令自动执行，修改/删除/移动/安装/权限变更命令暂停等待用户确认。RCE 级能力，只用于完全控制的私有部署。
 
 **关键设计决定**
 - 私有存储从 SQLite 虚拟文件系统改为真实目录映射；旧虚拟 FS 的 10 个 action 及独占代码已彻底移除，仅保留一次性的 `migratePrivateWorkspace`
-- drizzle migration 精简为 `service_restart_record.sql` + `workspace_items.sql`（后者仅被 `getFileAccess` 引用），全部 `IF NOT EXISTS` 幂等
+- drizzle migration 包含 `service_restart_record.sql`、`workspace_items.sql` 和 `ai_provider_config.sql`，全部 `IF NOT EXISTS` 幂等
 - 系统启动时间读 `/proc/stat` 的 btime 并进程内缓存，不随采样漂移

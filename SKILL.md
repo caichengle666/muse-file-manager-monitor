@@ -1,13 +1,13 @@
 ---
 name: "file-manager-monitor"
-description: "文件管理器 + 系统监控 + 网页终端（TypeScript 全栈：React 19 前端 + Bun 后端）。用于从零重建同款构件，或以 app/ 源码为起点二次开发。触发词：文件管理器、系统监控、file manager。"
+description: "文件管理器 + 系统监控 + AI Agent 网页终端（TypeScript 全栈：React 19 前端 + Bun 后端）。用于从零重建同款构件，或以 app/ 源码为起点二次开发。触发词：文件管理器、系统监控、AI 终端、file manager。"
 ---
 
 # File Manager + Monitor
 
 ## Purpose
 
-三层全栈应用：**文件页**（系统 / 工作区 / 构件 / 私有四种浏览模式，可编辑保存，图片可预览）+ **监控页**（CPU / 内存 / 磁盘 / 网络 / 进程，1 秒轮询画曲线，挂载点独立容量、每核 CPU、网卡拆分、目录占用排行、重启记录）+ **终端页签**（网页里执行 shell 命令）。`app/` 是完整源码快照，`references/architecture.md` 是架构说明。
+三层全栈应用：**文件页**（系统 / 工作区 / 构件 / 私有四种浏览模式，可编辑保存，图片可预览）+ **监控页**（CPU / 内存 / 磁盘 / 网络 / 进程，1 秒轮询画曲线，挂载点独立容量、每核 CPU、网卡拆分、目录占用排行、重启记录）+ **终端页签**（网页 Shell + 外部 OpenAI-compatible API 驱动的多步 AI Agent）。`app/` 是完整源码快照，`references/architecture.md` 是架构说明。
 
 ## Workflow（日常维护，原作者环境）
 
@@ -27,11 +27,14 @@ description: "文件管理器 + 系统监控 + 网页终端（TypeScript 全栈�
 1. 先读完本文件、`references/architecture.md` 和 `references/changelog.md`，重点看 changelog 里每个版本"为什么这么改"（比如：私有模式为什么从虚拟文件系统改成真实目录、"上一级"为什么放开、系统启动时间为什么改读 btime）。
 2. 在你的 Muse 里创建一个新的 web_fullstack artifact（名字和 slug 你自己定，不要沿用 `space-2`），把 `app/` 下的 `client/`（React 19 前端）和 `server/`（Bun 后端）源码完整交给构建器。**复刻模式下必须逐文件原样复用，不得重写或重新设计**；平台接口（`defineAction`、`definePrivilegedContracts`、`ctx.blobs`、drizzle 上下文）在同一 Muse 构件平台直接可用。
 3. 平台接口：本项目依赖构件平台注入的 `defineAction`、`definePrivilegedContracts`、`ctx.blobs` 和 drizzle 上下文——同一 Muse 构件平台上这些直接可用；换到别的平台，按 `references/architecture.md` 的"独立运行"节写适配层。
-4. 数据库：`app/drizzle/` 下有两个 migration（`meta/_journal.json` 登记执行顺序），都是幂等的 `CREATE TABLE IF NOT EXISTS`：
+4. 数据库：`app/drizzle/` 下有三个 migration（`meta/_journal.json` 登记执行顺序），都是幂等的 `CREATE TABLE IF NOT EXISTS`：
    - `workspace_items.sql`：旧私有虚拟文件系统的表，v1.2 起业务已废弃（私有改成真实目录），但十几个旧 action 代码仍引用它，保留建表；
    - `service_restart_record.sql`：服务重启记录表（累计次数/上次启动时间），监控页用。
-5. 构建完按这份清单验收：文件页四种模式浏览 / 新建 / 删除 / 重命名 / 上传 / 下载；点图片弹出深色查看器（缩放/1:1/下载/左右切换）；监控页 1 秒刷新、九项指标有数；终端能执行命令并返回结果；重启服务后"累计重启次数"加 1。
-6. 安全：网页终端是 RCE 级能力，只部署在你完全控制的私有环境，不要暴露到公网；敏感文件开关默认隐藏。
+   - `ai_provider_config.sql`：外部 AI 服务配置表（兼容 OpenAI 的 base URL、API Key、模型、更新时间）；API Key 只由服务端读取，前端只显示是否已配置。
+5. AI 终端 Agent：复刻时必须保留 `getAiProviderConfig`、`saveAiProviderConfig`、`listAiModels`、`generateAiShellCommand`、`runAiTask` 这些 action。配置流程是：填写 OpenAI-compatible API 地址和 Key → 拉取模型 → 选择模型 → 保存到服务器。Agent 流程是：自然语言任务 → 生成一条命令 → 在沙盒执行 → 把 stdout/stderr 回传模型 → 继续下一步，直到完成、失败或达到 20 步上限。
+6. 命令权限：读取、搜索、检查、测试类命令自动执行；修改、删除、移动、安装、权限变更类命令必须暂停并由用户确认后继续。服务端和前端都要保留这层确认，不得只靠按钮文案。单条命令最长 30 秒，超时后把结果回传 Agent 并结束该步。
+7. 构建完按这份清单验收：文件页四种模式浏览 / 新建 / 删除 / 重命名 / 上传 / 下载；点图片弹出深色查看器（缩放/1:1/下载/左右切换）；监控页 1 秒刷新、九项指标有数；终端能执行命令并返回结果；AI 配置可拉取模型并落盘；输入多步任务后 Agent 能读取命令输出继续下一步；修改/删除命令会暂停确认；重启服务后"累计重启次数"加 1。
+8. 安全：网页终端和 AI Agent 都是 RCE 级能力，只部署在你完全控制的私有环境，不要暴露到公网；敏感文件开关默认隐藏；公开仓库不要写入真实 API Key、主机名或路径。
 
 ## Operating Rules
 

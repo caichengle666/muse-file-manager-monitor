@@ -2,7 +2,7 @@
 
 文件管理器 + 系统监控 + 网页终端。TypeScript 全栈：React 19 前端 + Bun 后端。
 
-这是 **Muse skill**：`SKILL.md` 是入口，`references/` 是架构与变更记录，`app/` 是完整源码快照（v1.6）。
+这是 **Muse skill**：`SKILL.md` 是入口，`references/` 是架构与变更记录，`app/` 是完整源码快照（v0.1）。
 
 ## 安装为 skill
 

@@ -8,10 +8,9 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
 export const AI_REQUEST_TIMEOUT_MS = 60_000;
-// Agent steps run inside one platform action call. Keep each call short so the
-// gateway never sees a multi-minute request: the client drives the loop one step
-// at a time and asks the model with a tighter timeout than plain model listing.
-export const AI_AGENT_REQUEST_TIMEOUT_MS = 20_000;
+// Agent steps run inside one platform action call. Keep each call below the
+// gateway limit while still allowing slow models enough time to answer.
+export const AI_AGENT_REQUEST_TIMEOUT_MS = 45_000;
 
 /**
  * Structured failure details for the AI terminal. The UI shows these verbatim so a

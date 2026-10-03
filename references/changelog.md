@@ -23,7 +23,7 @@
 - 修复 AI Agent 在 worker 已以 root 运行时命令不执行的问题：原先 root 分支写成两个独立 `if`，导致 `runAsRoot=true` 且 `getuid()==0` 时既不进 sudo 也不进普通 shell，Promise 永不返回，最终报 `parse privileged executor response`；现在用 `selectShellExecutionMode` 显式三态分流并加了回归单测
 - AI Agent 执行的命令和输出会同步到网页终端输出区（标记为 `AI $`），不再只显示在 Agent 小面板里
 - AI 终端面板改为「折叠配置 + 对话区」：模型配置默认收起（未配置时自动展开），任务以对话形式展示，每条回复内联显示该步命令、stdout/stderr、退出码和 cwd，底部输入框可持续追加要求
-- 修复 AI Agent 报 `Gateway request timed out: spaces.cvm.post`：根因是 `runAiTask` 在单个请求里跑最多 20 步（每步一次模型调用最长 60 秒 + 一次命令最长 30 秒），超出平台网关等待上限；现在每次调用只做一件事（要么问模型、要么执行已排队的命令），前端自动连续调用直到完成，单次请求上限降到 20 秒模型超时或 30 秒命令超时
+- 修复 AI Agent 报 `Gateway request timed out: spaces.cvm.post`：根因是 `runAiTask` 在单个请求里跑最多 20 步（每步一次模型调用最长 60 秒 + 一次命令最长 30 秒），超出平台网关等待上限；现在每次调用只做一件事（要么问模型、要么执行已排队的命令），前端自动连续调用直到完成，单次请求上限降到 45 秒模型超时或 30 秒命令超时
 - 加固模型输出解析：模型接口返回体不是合法 JSON 时给出明确错误而不是裸抛；`message.content` 同时支持字符串和分段数组两种返回形状；模型无视 JSON 约定只返回 ```bash 代码块时，回退执行代码块里的第一条命令
 - AI Agent 失败时改为返回结构化诊断（阶段 / 请求地址 / 模型名 / HTTP 状态 / 原始响应片段 / 模型返回内容），前端在对话区以卡片形式展示并可一键复制；诊断文本不再脱敏，API Key 原样显示（自用私有部署）；拉取模型和保存配置失败也不再静默，直接在对话区报原因
 - 兼容 OpenAI `tool_calls` / `function_call` 返回：请求显式声明 `bash` function tool，解析层同时支持 `content` 字符串、分段数组和工具参数；模型只回空 `{}` 参数时给出明确诊断，不再含糊报“没有返回内容”；同时修复 `runAiTask` 里空命令被误判为任务完成的问题

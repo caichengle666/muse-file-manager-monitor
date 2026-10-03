@@ -95,7 +95,7 @@ export const privileged = definePrivilegedContracts({
     timeoutMs: 15000,
   },
   executeShell: {
-    request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000) }),
+    request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null) }),
     response: z.object({ ok: z.boolean(), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), timedOut: z.boolean(), cwd: z.string(), durationMs: z.number().int() }),
     timeoutMs: 30000,
   },
@@ -675,14 +675,29 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
 
   async executeShell(args) {
     const directory = getDirectory(args.root, args.path, true);
-    const cwd = directory?.absolute ?? findRoot(args.root)?.path ?? process.cwd();
+    let cwd = directory?.absolute ?? findRoot(args.root)?.path ?? process.cwd();
+    if (args.cwd) {
+      try { if (statSync(args.cwd).isDirectory()) cwd = realpathSync(args.cwd); } catch { /* fall back to the selected root */ }
+    }
     const started = Date.now();
+    const marker = `__MUSE_CWD_${crypto.randomUUID()}__`;
+    const wrappedCommand = `trap 'printf "\\n${marker}%s\\n" "$PWD"' EXIT\n${args.command}`;
     return new Promise((resolvePromise) => {
-      exec(args.command, { cwd, timeout: 30000, maxBuffer: 1_000_000, shell: "/bin/bash" }, (error, stdout, stderr) => {
+      exec(wrappedCommand, { cwd, timeout: 30000, maxBuffer: 1_000_000, shell: "/bin/bash" }, (error, stdout, stderr) => {
         const candidate = error as (Error & { code?: number | string; killed?: boolean; signal?: string }) | null;
         const timedOut = Boolean(candidate?.killed && candidate.signal === "SIGTERM");
         const code = typeof candidate?.code === "number" ? candidate.code : error ? null : 0;
-        resolvePromise({ ok: !error, stdout: String(stdout), stderr: timedOut ? `${String(stderr)}${stderr ? "\n" : ""}命令超过 30 秒，已终止。` : String(stderr), exitCode: code, timedOut, cwd, durationMs: Math.max(0, Date.now() - started) });
+        const output = String(stdout);
+        const markerIndex = output.lastIndexOf(`\n${marker}`);
+        let nextCwd = cwd;
+        let cleanStdout = output;
+        if (markerIndex >= 0) {
+          const markerEnd = output.indexOf("\n", markerIndex + 1);
+          const capturedCwd = output.slice(markerIndex + 1 + marker.length, markerEnd >= 0 ? markerEnd : output.length).trim();
+          if (capturedCwd) nextCwd = capturedCwd;
+          cleanStdout = output.slice(0, markerIndex) + output.slice(markerEnd >= 0 ? markerEnd + 1 : output.length);
+        }
+        resolvePromise({ ok: !error, stdout: cleanStdout, stderr: timedOut ? `${String(stderr)}${stderr ? "\n" : ""}命令超过 30 秒，已终止。` : String(stderr), exitCode: code, timedOut, cwd: nextCwd, durationMs: Math.max(0, Date.now() - started) });
       });
     });
   },

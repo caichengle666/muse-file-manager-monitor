@@ -96,7 +96,7 @@ async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path
 }
 
 type AiTaskMessage = { role: "system" | "user" | "assistant"; content: string };
-type AiTaskState = { configId: number; root: "system" | "workspace" | "build" | "private"; path: string; messages: AiTaskMessage[]; pendingCommand: string; steps: Array<{ command: string; stdout: string; stderr: string; cwd: string; exitCode: number | null; requiresConfirmation: boolean }> };
+type AiTaskState = { configId: number; root: "system" | "workspace" | "build" | "private"; path: string; cwd: string | null; messages: AiTaskMessage[]; pendingCommand: string; steps: Array<{ command: string; stdout: string; stderr: string; cwd: string; exitCode: number | null; requiresConfirmation: boolean }> };
 const aiTasks = new Map<string, AiTaskState>();
 
 async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[]): Promise<{ command: string; explanation: string; done: boolean }> {
@@ -289,15 +289,20 @@ export const Actions = {
       const taskId = args.taskId ?? crypto.randomUUID();
       let state = args.taskId ? aiTasks.get(args.taskId) : undefined;
       if (!state) {
-        state = { configId: config.id, root: args.root, path: args.path, pendingCommand: "", steps: [], messages: [{ role: "system", content: "你是一个沙盒终端 Agent。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。读取、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
+        state = { configId: config.id, root: args.root, path: args.path, cwd: null, pendingCommand: "", steps: [], messages: [{ role: "system", content: "你是一个沙盒终端 Agent。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。读取、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
         aiTasks.set(taskId, state);
       }
-      if (state.pendingCommand) {
-        if (!args.approvePending) return { ok: true, taskId, status: "waiting_confirmation" as const, message: "等待确认后继续。", steps: state.steps, pendingCommand: state.pendingCommand };
-        state.messages.push({ role: "user", content: `用户已确认执行待执行命令：${state.pendingCommand}` });
-        state.pendingCommand = "";
-      }
       try {
+        if (state.pendingCommand) {
+          if (!args.approvePending) return { ok: true, taskId, status: "waiting_confirmation" as const, message: "等待确认后继续。", steps: state.steps, pendingCommand: state.pendingCommand };
+          const confirmedCommand = state.pendingCommand;
+          state.messages.push({ role: "user", content: `用户已确认执行待执行命令：${confirmedCommand}` });
+          state.pendingCommand = "";
+          const result = await ctx.executePrivileged(privileged.executeShell, { command: confirmedCommand, root: state.root, path: state.path, cwd: state.cwd });
+          state.cwd = result.cwd;
+          state.steps.push({ command: confirmedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: true });
+          state.messages.push({ role: "user", content: `命令：${confirmedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
+        }
         for (let step = 0; step < args.maxSteps; step += 1) {
           const next = await requestNextAiCommand(config, state.messages);
           if (next.done || !next.command) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null }; }
@@ -307,7 +312,8 @@ export const Actions = {
             state.pendingCommand = next.command;
             return { ok: true, taskId, status: "waiting_confirmation" as const, message: next.explanation || "这一步需要确认。", steps: state.steps, pendingCommand: next.command };
           }
-          const result = await ctx.executePrivileged(privileged.executeShell, { command: next.command, root: state.root, path: state.path });
+          const result = await ctx.executePrivileged(privileged.executeShell, { command: next.command, root: state.root, path: state.path, cwd: state.cwd });
+          state.cwd = result.cwd;
           state.steps.push({ command: next.command, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: false });
           state.messages.push({ role: "user", content: `命令：${next.command}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
         }
@@ -338,7 +344,7 @@ export const Actions = {
   }),
 
   executeShell: defineAction({
-    request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000) }),
+    request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null) }),
     response: z.object({ ok: z.boolean(), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), timedOut: z.boolean(), cwd: z.string(), durationMs: z.number().int() }),
     privileged: [privileged.executeShell],
     async handler(ctx, args) { return ctx.executePrivileged(privileged.executeShell, args); },

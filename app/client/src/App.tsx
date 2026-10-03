@@ -139,6 +139,7 @@ export function App() {
   const [hostDialog, setHostDialog] = useState<HostDialog>(null);
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>([]);
   const [terminalBusy, setTerminalBusy] = useState(false);
+  const terminalCwdRef = useRef<Record<string, string>>({});
   const hostUploadRef = useRef<HTMLInputElement>(null);
 
   const hostQuery = useQuery({
@@ -289,7 +290,9 @@ export function App() {
   async function runTerminal(command: string, root: HostRoot, path: string) {
     setTerminalBusy(true);
     try {
-      const result = await api.executeShell({ command, root, path });
+      const contextKey = `${root}:${path}`;
+      const result = await api.executeShell({ command, root, path, cwd: terminalCwdRef.current[contextKey] ?? null });
+      if (result.cwd) terminalCwdRef.current[contextKey] = result.cwd;
       setTerminalHistory((current) => [...current, { command, ...result }].slice(-30));
     } catch {
       setTerminalHistory((current) => [...current, { command, stdout: "", stderr: "命令执行请求失败。", exitCode: null, timedOut: false, cwd: "", durationMs: 0 }].slice(-30));

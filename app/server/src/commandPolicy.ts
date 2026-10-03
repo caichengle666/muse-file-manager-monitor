@@ -5,14 +5,10 @@
  * whole command. That let `sudo rm -rf`, `bash -c 'rm -rf ...'`, `find -delete`
  * and `echo x > file` slip through as "read only" and run without confirmation.
  *
- * The policy here is deliberately conservative:
- *   - read-only commands may auto-run,
- *   - known test commands may auto-run,
- *   - anything that mutates the filesystem, installs software, changes
- *     permissions, or cannot be proven read-only requires confirmation.
- *
- * Unknown commands always require confirmation. False positives only cost one
- * click; false negatives execute arbitrary code.
+ * Only commands that can write, modify, move, or delete files require
+ * confirmation. Other commands are intentionally allowed for this private
+ * artifact, including installs, service operations, network requests, and
+ * otherwise unknown commands.
  */
 
 export type CommandCategory = "read" | "test" | "mutating" | "unknown";
@@ -255,6 +251,30 @@ function assessInterpreter(name: string, args: string[]): CommandCategory {
   return "unknown";
 }
 
+function hasFileMutation(segment: string): boolean {
+  if (hasOutputRedirection(segment)) return true;
+  const { name, args } = extractBaseCommand(segment);
+  const direct = new Set(["rm", "rmdir", "unlink", "shred", "truncate", "dd", "mv", "cp", "install", "rsync", "scp", "sftp", "tee", "touch", "mkdir", "mknod", "ln", "link", "rename", "zip", "unzip", "gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "7z", "cpio", "patch"]);
+  if (direct.has(name)) return true;
+  if (name === "sed" && hasAnyFlag(args, new Set(["-i", "--in-place"]))) return true;
+  if ((name === "awk" || name === "gawk") && hasAnyFlag(args, new Set(["-i", "--include"])) && args.includes("inplace")) return true;
+  if (name === "find" && hasAnyFlag(args, new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"]))) return true;
+  if (name === "tar") {
+    const flag = args.find((arg) => arg.startsWith("-") && !arg.startsWith("--")) ?? "";
+    if (/[xcruAd]/.test(flag.slice(1))) return true;
+  }
+  if ((name === "curl" && hasAnyFlag(args, new Set(["-o", "-O", "--output", "--remote-name"]))) || (name === "wget" && hasAnyFlag(args, new Set(["-O", "-o", "-P", "--output-document", "--output-file", "--directory-prefix"])))) return true;
+  if (SHELL_INTERPRETERS.has(name) || INLINE_CODE_FLAGS.has(name) || name === "deno") {
+    return /(?:>|>>|\b(?:rm|rmdir|unlink|shred|truncate|dd|mv|cp|install|tee|touch|mkdir|mkdirp|writeFile|writeFileSync|appendFile|appendFileSync|unlinkSync|rmSync|rmdirSync|renameSync|copyFileSync|write_text|write_bytes)\b|find\s+[^\n]*\-(?:delete|exec)|sed\s+[^\n]*\-i)/i.test(segment);
+  }
+  if (COMMAND_SUBSTITUTION.test(segment)) return /\b(?:rm|rmdir|unlink|shred|truncate|dd|mv|cp|install|tee|touch|mkdir|writeFile|writeFileSync|appendFile|appendFileSync|unlinkSync|rmSync|rmdirSync|renameSync|copyFileSync)\b/i.test(segment);
+  if (name === "git") {
+    const sub = firstNonFlag(args, new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"]));
+    return ["checkout", "restore", "reset", "clean", "apply", "am", "merge", "rebase", "cherry-pick"].includes(sub);
+  }
+  return false;
+}
+
 function assessSegment(segment: string): { category: CommandCategory; reason: string } {
   const { name, args } = extractBaseCommand(segment);
   if (!name) return { category: "unknown", reason: "空命令段" };
@@ -339,11 +359,10 @@ export function assessCommand(command: string): CommandAssessment {
   if (!trimmed) return { requiresConfirmation: true, category: "unknown", reason: "空命令" };
   const segments = splitShellSegments(trimmed);
   if (!segments.length) return { requiresConfirmation: true, category: "unknown", reason: "空命令" };
-  const results = segments.map((segment) => assessSegment(segment));
-  const mutating = results.find((result) => result.category === "mutating");
-  if (mutating) return { requiresConfirmation: true, category: "mutating", reason: mutating.reason };
-  const unknown = results.find((result) => result.category === "unknown");
-  if (unknown) return { requiresConfirmation: true, category: "unknown", reason: unknown.reason };
-  const isTest = results.some((result) => result.category === "test");
-  return { requiresConfirmation: false, category: isTest ? "test" : "read", reason: isTest ? "测试命令自动执行" : "只读命令自动执行" };
+  const results = segments.map((segment) => ({ segment, assessment: assessSegment(segment) }));
+  const fileMutation = results.find(({ segment }) => hasFileMutation(segment));
+  if (fileMutation) return { requiresConfirmation: true, category: "mutating", reason: fileMutation.assessment.reason };
+  const isTest = results.some((result) => result.assessment.category === "test");
+  const isUnknown = results.some((result) => result.assessment.category === "unknown");
+  return { requiresConfirmation: false, category: isTest ? "test" : isUnknown ? "unknown" : "read", reason: isTest ? "测试命令自动执行" : "非文件变更命令自动执行" };
 }

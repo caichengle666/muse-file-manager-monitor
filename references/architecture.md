@@ -35,7 +35,7 @@
 - **符号链接**：v1.1 起允许跟随（此前只列出不跟随）。
 - **文本判定** `isLikelyText`：43 种已知文本扩展名直接放行，否则检查文件头 64KB——含 NUL 字节、UTF-8 严格解码失败、或控制字符超 2% 即判二进制；二进制不再直接拒绝，提供 hex 预览或下载。
 - **编辑门控**：前端编辑按钮仅当后端返回 `editable=true`（文本类型 + 有写权限）才显示。
-- **命令白名单**：`app/server/src/commandPolicy.ts` 将命令分为 read / test / mutating / unknown；只有 read 与 test 自动执行，其余全部需服务端一次性 `confirmToken` 确认。`sudo`、`bash -c`、`find -delete`、输出重定向、命令替换、管道到 shell 都会归入需确认。
+- **命令确认**：`app/server/src/commandPolicy.ts` 只拦截能写入、修改、移动或删除文件的命令；重定向、`rm`/`cp`/`mv`/`tee`、原地 `sed`、`find -delete/-exec`、解包和脚本中的文件写入需要一次性 `confirmToken`。安装、Git、网络、服务、权限、容器和未知命令自动执行，符合私有沙盒的使用场景。
 - **AI 接口防护**：模型 base URL 必须公网 http(s)（拒绝 localhost/私网/链路本地/.local），请求 60 秒超时且禁止重定向；API Key 明文存 SQLite，请把 `app.db` 当密钥文件保护。
 - **Agent 调用模型**：`runAiTask` 每次调用只做一件事——要么问模型要下一步命令（100 秒超时），要么执行已排队的命令（30 秒超时）；多步循环由前端反复调用驱动，避免 `Gateway request timed out: spaces.cvm.post`。
 - **模型输出解析**：请求显式声明 `bash` function tool；`message` 兼容 `content` 字符串、分段数组、`tool_calls` 与旧的 `function_call` 四种形状；工具参数若为原始命令字符串会自动包装成 JSON；JSON 解析失败时依次尝试「首个括号平衡对象」和「从文本抢救 command/explanation/done 字段」（容忍截断、尾逗号、单引号、无引号键），都不行再回退 ```bash 代码块首条命令。全部为本地实现，不引入 JSON repair 依赖。

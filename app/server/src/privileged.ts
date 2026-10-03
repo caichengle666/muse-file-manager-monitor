@@ -95,7 +95,7 @@ export const privileged = definePrivilegedContracts({
     timeoutMs: 15000,
   },
   executeShell: {
-    request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null) }),
+    request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null), runAsRoot: z.boolean().default(false) }),
     response: z.object({ ok: z.boolean(), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), timedOut: z.boolean(), cwd: z.string(), durationMs: z.number().int() }),
     timeoutMs: 30000,
   },
@@ -683,7 +683,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const marker = `__MUSE_CWD_${crypto.randomUUID()}__`;
     const wrappedCommand = `trap 'printf "\\n${marker}%s\\n" "$PWD"' EXIT\n${args.command}`;
     return new Promise((resolvePromise) => {
-      exec(wrappedCommand, { cwd, timeout: 30000, maxBuffer: 1_000_000, shell: "/bin/bash" }, (error, stdout, stderr) => {
+      const onComplete = (error: Error | null, stdout: string | Buffer, stderr: string | Buffer) => {
         const candidate = error as (Error & { code?: number | string; killed?: boolean; signal?: string }) | null;
         const timedOut = Boolean(candidate?.killed && candidate.signal === "SIGTERM");
         const code = typeof candidate?.code === "number" ? candidate.code : error ? null : 0;
@@ -698,7 +698,10 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
           cleanStdout = output.slice(0, markerIndex) + output.slice(markerEnd >= 0 ? markerEnd + 1 : output.length);
         }
         resolvePromise({ ok: !error, stdout: cleanStdout, stderr: timedOut ? `${String(stderr)}${stderr ? "\n" : ""}命令超过 30 秒，已终止。` : String(stderr), exitCode: code, timedOut, cwd: nextCwd, durationMs: Math.max(0, Date.now() - started) });
-      });
+      };
+      const options = { cwd, timeout: 30000, maxBuffer: 1_000_000 };
+      if (args.runAsRoot && typeof process.getuid === "function" && process.getuid() !== 0) execFile("sudo", ["-n", "/bin/bash", "-c", wrappedCommand], options, onComplete);
+      else exec(wrappedCommand, { ...options, shell: "/bin/bash" }, onComplete);
     });
   },
 

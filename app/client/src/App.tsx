@@ -482,6 +482,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   const [command, setCommand] = useState("");
   const [root, setRoot] = useState<HostRoot>("workspace");
   const [path, setPath] = useState("");
+  const [locationOpen, setLocationOpen] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiBaseUrl, setAiBaseUrl] = useState("https://api.openai.com");
   const [aiApiKey, setAiApiKey] = useState("");
@@ -572,7 +573,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   }
   return <section className="terminal-panel" aria-label="终端">
     <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 30 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
-    <div className="terminal-location"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div>
+    <div className={`terminal-location ${locationOpen ? "is-open" : "is-collapsed"}`}><button type="button" className="terminal-location-toggle" onClick={() => setLocationOpen((open) => !open)} aria-expanded={locationOpen}>执行位置 <span>{root === "workspace" ? "工作区" : root} · {path || "根目录"}</span><b>{locationOpen ? "收起" : "展开"}</b></button><div className="terminal-location-fields"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div></div>
     <div className={`ai-terminal-panel ${agentExpanded ? "is-expanded" : "is-collapsed"}`}>
       <div className="ai-terminal-heading">
         <div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div>

@@ -149,6 +149,8 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .terminal-toolbar small { color: #8fa098; font-size: 10px; }
 .terminal-toolbar button { border: 1px solid #42534c; border-radius: 5px; padding: 7px 9px; background: transparent; color: #b5c3bc; font-size: 11px; cursor: pointer; }
 .terminal-location { grid-area: location; display: grid; grid-template-columns: 118px 1fr; gap: 8px; padding: 10px; background: #1a2420; border-bottom: 1px solid #34413c; }
+.terminal-location-toggle { display: none; }
+.terminal-location-fields { display: contents; }
 .terminal-location label { display: grid; gap: 4px; color: #8fa098; font-size: 9px; }
 .terminal-location select, .terminal-location input { min-width: 0; height: 34px; padding: 5px 8px; border: 1px solid #42534c; border-radius: 4px; background: #0d1411; color: #dce8df; font: 11px/1.2 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
 .terminal-output { grid-area: output; min-height: 0; max-height: none; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-color: #4b6256 #0d1713; scrollbar-width: thin; padding: 14px; background: #08100d; color: #c7d5ce; font: 11px/1.55 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
@@ -531,6 +533,12 @@ button:disabled { opacity: .52; cursor: not-allowed; }
   .terminal-panel { height: auto; min-height: calc(100dvh - 68px); grid-template-rows: auto auto minmax(170px, 30dvh) auto auto auto; grid-template-areas: "toolbar" "location" "output" "ai" "command" "ai-bar"; padding: 0 0 max(88px, calc(72px + env(safe-area-inset-bottom))); }
   .terminal-toolbar { padding: 12px 14px; }
   .terminal-location { grid-template-columns: minmax(0, 118px) minmax(0, 1fr); }
+  .terminal-location { display: block; padding: 0; }
+  .terminal-location-toggle { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 42px; padding: 8px 12px; border: 0; background: #1a2420; color: #dce8df; text-align: left; font: 600 11px/1.2 "IBM Plex Mono", ui-monospace, monospace; }
+  .terminal-location-toggle span { min-width: 0; overflow: hidden; color: #8fa098; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+  .terminal-location-toggle b { flex: 0 0 auto; color: #b7f34a; font-size: 9px; font-weight: 600; }
+  .terminal-location-fields { display: none; }
+  .terminal-location.is-open .terminal-location-fields { display: grid; grid-template-columns: minmax(0, 118px) minmax(0, 1fr); gap: 8px; padding: 0 10px 10px; }
   .terminal-output { min-height: 170px; padding: 12px; }
   .ai-terminal-panel { min-height: 0; padding: 12px; }
   .ai-terminal-panel.is-collapsed { display: none; }
@@ -554,6 +562,7 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 
 @media (max-width: 420px) {
   .terminal-location { grid-template-columns: 1fr; }
+  .terminal-location.is-open .terminal-location-fields { grid-template-columns: 1fr; }
   .terminal-toolbar small { max-width: 170px; line-height: 1.35; }
   .terminal-command { grid-template-columns: auto minmax(0, 1fr); }
   .terminal-command button { grid-column: 1 / -1; width: 100%; }

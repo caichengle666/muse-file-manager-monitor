@@ -99,7 +99,7 @@ function splitShellSegments(command: string): string[] {
       continue;
     }
     if (char === "'" || char === '"') { quote = char; current += char; continue; }
-    const isDescriptorCopy = char === "&" && command[index - 1] === ">" && /[0-9-]/.test(command[index + 1] ?? "");
+    const isDescriptorCopy = char === "&" && (command[index - 1] === ">" || command[index - 1] === "<") && /[0-9-]/.test(command[index + 1] ?? "");
     const isCombinedRedirect = char === "&" && command[index + 1] === ">";
     if (char === ";" || char === "\n" || ((char === "&" || char === "|") && !isDescriptorCopy && !isCombinedRedirect)) {
       if ((char === "&" || char === "|") && command[index + 1] === char) index += 1;
@@ -272,7 +272,7 @@ function hasFileMutation(segment: string): boolean {
   }
   if ((name === "curl" && hasAnyFlag(args, new Set(["-o", "-O", "--output", "--remote-name"]))) || (name === "wget" && hasAnyFlag(args, new Set(["-O", "-o", "-P", "--output-document", "--output-file", "--directory-prefix"])))) return true;
   if (SHELL_INTERPRETERS.has(name) || INLINE_CODE_FLAGS.has(name) || name === "deno") {
-    return /(?:>|>>|\b(?:rm|rmdir|unlink|shred|truncate|dd|mv|cp|install|tee|touch|mkdir|mkdirp|writeFile|writeFileSync|appendFile|appendFileSync|unlinkSync|rmSync|rmdirSync|renameSync|copyFileSync|write_text|write_bytes)\b|find\s+[^\n]*\-(?:delete|exec)|sed\s+[^\n]*\-i)/i.test(segment);
+    return /(?:>>?|&>)(?!&(?:\d+|-))|\b(?:rm|rmdir|unlink|shred|truncate|dd|mv|cp|install|tee|touch|mkdir|mkdirp|writeFile|writeFileSync|appendFile|appendFileSync|unlinkSync|rmSync|rmdirSync|renameSync|copyFileSync|write_text|write_bytes)\b|find\s+[^\n]*\-(?:delete|exec)|sed\s+[^\n]*\-i/i.test(segment);
   }
   if (COMMAND_SUBSTITUTION.test(segment)) return /\b(?:rm|rmdir|unlink|shred|truncate|dd|mv|cp|install|tee|touch|mkdir|writeFile|writeFileSync|appendFile|appendFileSync|unlinkSync|rmSync|rmdirSync|renameSync|copyFileSync)\b/i.test(segment);
   if (name === "git") {

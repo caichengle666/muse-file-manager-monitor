@@ -452,8 +452,9 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .ai-terminal-heading > div { display: grid; gap: 2px; }
 .ai-terminal-heading strong { color: #dce8df; font: 700 13px/1.2 "IBM Plex Mono", ui-monospace, monospace; }
 .ai-terminal-heading small, .ai-terminal-heading > span { color: #8fa098; font-size: 10px; }
-.ai-terminal-heading-actions { display: flex; align-items: center; gap: 10px; }
-.ai-terminal-heading-actions > span { color: #8fa098; font-size: 10px; }
+.ai-terminal-heading-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: center; gap: 6px; min-width: 0; }
+.ai-terminal-heading-actions > span { grid-column: 1 / -1; color: #8fa098; font-size: 10px; }
+.ai-terminal-heading-actions button { min-width: 0; white-space: nowrap; }
 .ai-config-toggle { min-height: 28px; padding: 4px 9px; border: 1px solid #52665b; border-radius: 4px; background: transparent; color: #b5c3bc; font-size: 10px; cursor: pointer; }
 .ai-config-toggle:hover { border-color: #b7f34a; color: #dce8df; }
 .ai-panel-toggle { min-height: 28px; padding: 4px 9px; border: 1px solid #52665b; border-radius: 4px; background: #24322b; color: #dce8df; font-size: 10px; cursor: pointer; }
@@ -552,8 +553,6 @@ button:disabled { opacity: .52; cursor: not-allowed; }
   .ai-collapsed-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
   .ai-collapsed-actions button { min-width: auto; width: auto; height: 36px; min-height: 36px; max-height: 36px; padding: 0 6px; }
   .ai-terminal-heading { gap: 8px; }
-  .ai-terminal-heading-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; min-width: 0; }
-  .ai-terminal-heading-actions > span { grid-column: 1 / -1; width: auto; }
   .ai-terminal-heading-actions button { min-width: 0; padding-inline: 4px; white-space: nowrap; }
   .agent-chat { min-height: 160px; }
   .terminal-command { min-height: 58px; padding: 9px 10px max(9px, env(safe-area-inset-bottom)); }

@@ -82,7 +82,6 @@ const TEST_COMMANDS = new Set([
   "nose2", "gtest", "unittest", "playwright", "cypress",
 ]);
 
-const OUTPUT_REDIRECT = /(^|[^<])(>>?)(?!=)/;
 const COMMAND_SUBSTITUTION = /\$\(|`|<\(|>\(/;
 
 function splitShellSegments(command: string): string[] {
@@ -100,7 +99,9 @@ function splitShellSegments(command: string): string[] {
       continue;
     }
     if (char === "'" || char === '"') { quote = char; current += char; continue; }
-    if (char === ";" || char === "\n" || char === "&" || char === "|") {
+    const isDescriptorCopy = char === "&" && command[index - 1] === ">" && /[0-9-]/.test(command[index + 1] ?? "");
+    const isCombinedRedirect = char === "&" && command[index + 1] === ">";
+    if (char === ";" || char === "\n" || ((char === "&" || char === "|") && !isDescriptorCopy && !isCombinedRedirect)) {
       if ((char === "&" || char === "|") && command[index + 1] === char) index += 1;
       segments.push(current);
       current = "";
@@ -171,7 +172,13 @@ function hasOutputRedirection(segment: string): boolean {
     if (char === "\\") { escaped = true; continue; }
     if (quote) { if (char === quote) quote = null; continue; }
     if (char === "'" || char === '"') { quote = char; continue; }
-    if (char === ">") return OUTPUT_REDIRECT.test(segment.slice(index));
+    if (char === ">") {
+      if (/^>>?&(?:\d+|-)/.test(segment.slice(index))) {
+        index += segment.slice(index).match(/^>>?&(?:\d+|-)/)?.[0].length ?? 0;
+        continue;
+      }
+      return true;
+    }
   }
   return false;
 }

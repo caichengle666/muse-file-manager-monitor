@@ -3,6 +3,12 @@ import { assessCommand } from "./commandPolicy";
 
 const autoRun = [
   "ls -la",
+  "ls -la / 2>&1",
+  "cat file 2>&1",
+  "git log --oneline 2>&1",
+  "echo ok >&2",
+  "echo ok 1>&2",
+  "echo ok 2>&-",
   "pwd && git status",
   "git log --oneline -5",
   "git diff --stat",
@@ -50,6 +56,8 @@ const needsConfirmation = [
   "find /tmp -exec rm {} ;",
   "echo x > /tmp/x",
   "echo x >> /tmp/x",
+  "echo ok 2> error.log",
+  "echo ok &> output.log",
   "git -C /tmp clean -fdx",
   "git checkout main",
   "git reset --hard",

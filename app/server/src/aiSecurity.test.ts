@@ -61,6 +61,10 @@ describe("model output parsing", () => {
     expect(parseAiCommandContent('{"command":"pwd","explanation":"show cwd","done":false}')).toEqual({ command: "pwd", explanation: "show cwd", done: false });
   });
 
+  test("does not treat a string false marker as done", () => {
+    expect(parseAiCommandContent('{"command":"pwd","explanation":"show cwd","done":"false"}').done).toBe(false);
+  });
+
   test("parses fenced JSON", () => {
     expect(parseAiCommandContent('```json\n{"command":"ls","explanation":"","done":false}\n```').command).toBe("ls");
   });

@@ -104,20 +104,17 @@ function aiDiagnostic(phase: AiDiagnostic["phase"], url: string, model: string, 
 async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path: string, init?: RequestInit, timeoutMs = AI_REQUEST_TIMEOUT_MS): Promise<Response> {
   const baseUrl = requirePublicBaseUrl(config.baseUrl);
   const url = `${baseUrl}${path}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const signal = AbortSignal.timeout(timeoutMs);
   try {
     return await fetch(url, {
       ...init,
-      signal: controller.signal,
+      signal,
       redirect: "error",
       headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", ...(init?.headers ?? {}) },
     });
   } catch (error) {
-    const reason = controller.signal.aborted ? `请求超过 ${timeoutMs / 1000} 秒未响应，已中止` : error instanceof Error ? error.message : "未知网络错误";
+    const reason = signal.aborted ? `请求超过 ${timeoutMs / 1000} 秒未响应，已中止` : error instanceof Error ? error.message : "未知网络错误";
     throw new AiRequestError(`模型请求失败：${reason}`, aiDiagnostic("request", url, config.model, reason));
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -223,8 +220,13 @@ async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$infe
     throw new AiEmptyOutputError("模型没有返回内容", aiDiagnostic("model-json", requestUrl, config.model, "接口调用成功，但 choices[0].message.content 为空。可能是模型名不对、被内容策略拦截，或返回了非标准的流式结构。", { status: response.status, responseSnippet: raw.slice(0, 800) }));
   }
   try {
-    return parseAiCommandContent(content);
+    const parsed = parseAiCommandContent(content);
+    if (!parsed.command && !parsed.done) {
+      throw new AiEmptyOutputError("模型没有返回可执行命令", aiDiagnostic("model-json", requestUrl, config.model, "模型返回了 JSON，但 command 为空且 done=false。", { status: response.status, responseSnippet: raw.slice(0, 800), contentSnippet: content.slice(0, 800) }));
+    }
+    return parsed;
   } catch (error) {
+    if (error instanceof AiEmptyOutputError) throw error;
     throw new AiRequestError(error instanceof Error ? error.message : "模型输出无法解析", aiDiagnostic("model-json", requestUrl, config.model, "模型没有按要求返回 JSON，也无法从代码块中提取命令。可以在模型配置里换一个指令遵循能力更强的模型。", { status: response.status, responseSnippet: raw.slice(0, 800), contentSnippet: content.slice(0, 800) }));
   }
 }

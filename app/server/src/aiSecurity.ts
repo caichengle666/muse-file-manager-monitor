@@ -133,7 +133,7 @@ export function parseAiCommandContent(content: string): { command: string; expla
       const value: unknown = JSON.parse(candidate);
       if (value && typeof value === "object") {
         const record = value as { command?: unknown; explanation?: unknown; done?: unknown };
-        return { command: String(record.command ?? "").trim(), explanation: String(record.explanation ?? ""), done: Boolean(record.done) };
+        return { command: String(record.command ?? "").trim(), explanation: String(record.explanation ?? ""), done: record.done === true };
       }
     } catch { /* try the next candidate */ }
   }

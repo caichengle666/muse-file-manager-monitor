@@ -536,8 +536,12 @@ button:disabled { opacity: .52; cursor: not-allowed; }
   .ai-terminal-panel.is-collapsed { display: none; }
   .ai-terminal-panel.is-expanded { position: fixed; z-index: 40; inset: 68px 0 max(0px, env(safe-area-inset-bottom)); min-height: 0; border: 1px solid #34413c; box-shadow: 0 18px 50px rgba(0,0,0,.34); }
   .ai-terminal-panel.is-expanded .agent-chat { min-height: 0; }
-  .ai-collapsed-bar { grid-area: ai-bar; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 8px 10px max(8px, env(safe-area-inset-bottom)); border-top: 1px solid #34413c; background: #121917; }
-  .ai-collapsed-bar button { min-width: 0; width: 100%; }
+  .ai-collapsed-bar { grid-area: ai-bar; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 10px max(8px, env(safe-area-inset-bottom)); border-top: 1px solid #34413c; background: #121917; }
+  .ai-collapsed-copy { min-width: 0; flex: 1 1 auto; display: grid; gap: 2px; overflow: hidden; }
+  .ai-collapsed-copy strong { color: #dce8df; font: 700 12px/1.2 "IBM Plex Mono", ui-monospace, monospace; white-space: nowrap; }
+  .ai-collapsed-copy small, .ai-collapsed-copy span { overflow: hidden; color: #8fa098; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .ai-collapsed-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .ai-collapsed-actions button { min-width: auto; padding-inline: 6px; }
   .ai-terminal-heading { gap: 8px; }
   .ai-terminal-heading-actions { flex-wrap: wrap; gap: 6px; }
   .ai-terminal-heading-actions > span { width: 100%; }

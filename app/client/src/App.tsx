@@ -607,7 +607,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
       {busy && <div className="terminal-running">正在执行…</div>}
     </div>
     <form className="terminal-command" onSubmit={submit}><span aria-hidden="true">$</span><input aria-label="Shell 命令" autoCapitalize="off" autoCorrect="off" spellCheck={false} value={command} onChange={(event) => setCommand(event.target.value)} placeholder="例如：pwd && ls -la" /><button type="submit" disabled={busy || !command.trim()}>{busy ? "运行中" : "执行"}</button></form>
-    {!agentExpanded && <div className="ai-collapsed-bar" aria-label="AI Agent 操作"><button type="button" className="ai-panel-toggle" onClick={() => setAgentExpanded(true)}>展开对话</button><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>模型配置</button></div>}
+    {!agentExpanded && <div className="ai-collapsed-bar" aria-label="AI 终端 Agent"><div className="ai-collapsed-copy"><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small><span>自动读取输出并继续 · 改删操作确认</span></div><div className="ai-collapsed-actions"><button type="button" className="ai-panel-toggle" onClick={() => setAgentExpanded(true)}>展开对话</button><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>模型配置</button></div></div>}
   </section>;
 }
 

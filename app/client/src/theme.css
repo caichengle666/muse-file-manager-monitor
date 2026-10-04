@@ -574,6 +574,8 @@ button:disabled { opacity: .52; cursor: not-allowed; }
   .rail-title { font-size: 16px; }
   .workspace-layout .content-wrap { padding-inline: 20px; }
   .mode-switch { width: min(280px, 42vw); }
+  .ai-terminal-config { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ai-terminal-config button { width: 100%; }
   .brand-mark { min-width: 0; }
   .brand-mark small { display: none; }
 }

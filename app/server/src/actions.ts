@@ -132,6 +132,7 @@ type AiTaskState = {
   pendingTokenHash: string | null;
   pendingAutoRun: boolean;
   emptyRetries: number;
+  requestRetries: number;
   steps: AiTaskStep[];
   busy: boolean;
   updatedAt: number;
@@ -482,7 +483,7 @@ export const Actions = {
           try {
             const restored = JSON.parse(row.stateJson) as AiTaskState;
             if (restored.configId === config.id && restored.owner === owner && Array.isArray(restored.messages) && Array.isArray(restored.steps)) {
-              state = { ...restored, busy: false, updatedAt: Date.now(), pendingTokenHash: restored.pendingCommand ? null : restored.pendingTokenHash };
+              state = { ...restored, busy: false, updatedAt: Date.now(), emptyRetries: restored.emptyRetries ?? 0, requestRetries: restored.requestRetries ?? 0, pendingTokenHash: restored.pendingCommand ? null : restored.pendingTokenHash };
               aiTasks.set(taskId, state);
             }
           } catch {
@@ -495,7 +496,7 @@ export const Actions = {
       }
       if (state?.busy) return { ok: false, taskId, status: "running" as const, message: "任务正在执行，请等待当前步骤完成。", steps: state.steps, pendingCommand: state.pendingCommand || null, confirmToken: null, diagnostic: null };
       if (!state) {
-        state = { configId: config.id, owner, root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, emptyRetries: 0, steps: [], busy: false, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。只读、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
+        state = { configId: config.id, owner, root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, emptyRetries: 0, requestRetries: 0, steps: [], busy: false, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。只读、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
         aiTasks.set(taskId, state);
         pruneAiTasks();
       }
@@ -528,21 +529,25 @@ export const Actions = {
           state.cwd = result.cwd;
           state.steps.push({ command: queuedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: !isAutoRun });
           pushAiMessage(state, { role: "user", content: `命令：${queuedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
+          if (result.exitCode !== 0) pushAiMessage(state, { role: "user", content: "这条命令执行失败。请分析终端错误，自动修正命令并继续任务，不要等待用户重复提交。" });
           return { ok: true, taskId, status: "running" as const, message: "命令已执行，继续下一步。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
         }
         let next: { command: string; explanation: string; done: boolean };
         try {
-          next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS, state.emptyRetries === 0);
+          next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS, state.emptyRetries === 0 && state.requestRetries === 0);
         } catch (error) {
-          // Some OpenAI-compatible proxies return an empty tool call once and a
-          // valid one on the next turn. Retry a couple of times before failing.
-          if (error instanceof AiEmptyOutputError && state.emptyRetries < 2) {
-            state.emptyRetries += 1;
-            pushAiMessage(state, { role: "user", content: "上一次回复没有可执行内容。请只输出一个 JSON 对象：{\"command\":\"...\",\"explanation\":\"...\",\"done\":false}，不要使用工具调用，不要留空参数。" });
-            return { ok: true, taskId, status: "running" as const, message: "模型返回为空，已要求它重新输出。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
+          // Retry bounded model/network/protocol failures before surfacing the
+          // diagnostic. Empty output also gets the plain-JSON fallback prompt.
+          if (state.requestRetries < 2) {
+            state.requestRetries += 1;
+            if (error instanceof AiEmptyOutputError) state.emptyRetries += 1;
+            pushAiMessage(state, { role: "user", content: error instanceof AiEmptyOutputError ? "上一次回复没有可执行内容。请只输出一个 JSON 对象：{\"command\":\"...\",\"explanation\":\"...\",\"done\":false}，不要使用工具调用，不要留空参数。" : "上一次模型请求失败。请自动重试并继续任务，只输出一个 JSON 对象。" });
+            return { ok: true, taskId, status: "running" as const, message: `模型请求失败，已自动重试（${state.requestRetries}/2）。`, steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
           }
           throw error;
         }
+        state.requestRetries = 0;
+        state.emptyRetries = 0;
         if (next.done) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null }; }
         if (!next.command) throw new Error("模型没有返回可执行命令，且未标记任务完成。");
         const assessment = assessCommand(next.command);

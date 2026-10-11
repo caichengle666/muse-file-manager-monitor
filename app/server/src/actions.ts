@@ -1,6 +1,6 @@
 import { defineAction, z, type ActionsModule, type SpaceDb } from "@hatch/space-sdk";
-import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiEmptyOutputError, AiRequestError, type AiDiagnostic, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
-import { and, eq, sql } from "drizzle-orm";
+import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiEmptyOutputError, AiRequestError, type AiDiagnostic, assertPublicResolution, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { eq, sql } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import { assessCommand } from "./commandPolicy";
 import * as schema from "./schema";
@@ -13,22 +13,26 @@ const SERVICE_STARTED_AT = new Date();
 const SERVICE_STARTED_AT_MS = SERVICE_STARTED_AT.getTime();
 const SERVICE_INSTANCE_ID = crypto.randomUUID();
 let restartRecordPromise: Promise<RestartRecord> | null = null;
+let tablesPromise: Promise<void> | null = null;
+
+// The drizzle migrations create these tables; this guard covers a database that
+// was restored without migration state. Runs once per process.
+function ensureTables(db: Db): Promise<void> {
+  tablesPromise ??= (async () => {
+    await db.run(sql`CREATE TABLE IF NOT EXISTS service_restart_record (id integer PRIMARY KEY NOT NULL, restart_count integer NOT NULL DEFAULT 0, previous_started_at integer, current_started_at integer NOT NULL, instance_id text NOT NULL, updated_at integer NOT NULL)`);
+    await db.run(sql`CREATE TABLE IF NOT EXISTS ai_provider_config (id integer PRIMARY KEY NOT NULL, base_url text NOT NULL, api_key text NOT NULL, model text NOT NULL, updated_at integer NOT NULL)`);
+    await db.run(sql`CREATE TABLE IF NOT EXISTS ai_agent_context (id integer PRIMARY KEY NOT NULL, task_id text, root text NOT NULL, path text NOT NULL, pending_command text NOT NULL DEFAULT '', confirm_token text, messages_json text NOT NULL, state_json text, updated_at integer NOT NULL)`);
+  })().catch((error: unknown) => {
+    tablesPromise = null;
+    throw error;
+  });
+  return tablesPromise;
+}
 
 async function loadRestartRecord(db: Db): Promise<RestartRecord> {
   if (restartRecordPromise) return restartRecordPromise;
   restartRecordPromise = (async () => {
-    // The migration normally creates this table. Keeping the guard here makes
-    // startup self-healing if the database is restored without migration state.
-    await db.run(sql`
-      CREATE TABLE IF NOT EXISTS service_restart_record (
-        id integer PRIMARY KEY NOT NULL,
-        restart_count integer NOT NULL DEFAULT 0,
-        previous_started_at integer,
-        current_started_at integer NOT NULL,
-        instance_id text NOT NULL,
-        updated_at integer NOT NULL
-      )
-    `);
+    await ensureTables(db);
     await db
       .insert(schema.serviceRestartRecord)
       .values({
@@ -68,33 +72,13 @@ function encodeBase64(bytes: Uint8Array): string {
 }
 
 async function readAiConfig(db: Db): Promise<typeof schema.aiProviderConfig.$inferSelect | null> {
-  await db.run(sql`
-    CREATE TABLE IF NOT EXISTS ai_provider_config (
-      id integer PRIMARY KEY NOT NULL,
-      base_url text NOT NULL,
-      api_key text NOT NULL,
-      model text NOT NULL,
-      updated_at integer NOT NULL
-    )
-  `);
+  await ensureTables(db);
   const [config] = await db.select().from(schema.aiProviderConfig).where(eq(schema.aiProviderConfig.id, 1)).limit(1);
   return config ?? null;
 }
 
-async function ensureAiAgentContextTable(db: Db): Promise<void> {
-  await db.run(sql`
-    CREATE TABLE IF NOT EXISTS ai_agent_context (
-      id integer PRIMARY KEY NOT NULL,
-      task_id text,
-      root text NOT NULL,
-      path text NOT NULL,
-      pending_command text NOT NULL DEFAULT '',
-      confirm_token text,
-      messages_json text NOT NULL,
-      state_json text,
-      updated_at integer NOT NULL
-    )
-  `);
+function maskApiKey(key: string): string {
+  return key.length > 8 ? `${key.slice(0, 3)}…${key.slice(-4)}` : key ? "已保存" : "";
 }
 
 function aiDiagnostic(phase: AiDiagnostic["phase"], url: string, model: string, detail: string, extra?: { status?: number | null; responseSnippet?: string; contentSnippet?: string }): AiDiagnostic {
@@ -104,6 +88,7 @@ function aiDiagnostic(phase: AiDiagnostic["phase"], url: string, model: string, 
 async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path: string, init?: RequestInit, timeoutMs = AI_REQUEST_TIMEOUT_MS): Promise<Response> {
   const baseUrl = requirePublicBaseUrl(config.baseUrl);
   const url = `${baseUrl}${path}`;
+  await assertPublicResolution(url);
   const signal = AbortSignal.timeout(timeoutMs);
   try {
     return await fetch(url, {
@@ -121,8 +106,6 @@ async function aiFetch(config: typeof schema.aiProviderConfig.$inferSelect, path
 type AiTaskMessage = { role: "system" | "user" | "assistant"; content: string };
 type AiTaskStep = { command: string; stdout: string; stderr: string; cwd: string; exitCode: number | null; requiresConfirmation: boolean };
 type AiTaskState = {
-  configId: number;
-  owner: string;
   root: "system" | "workspace" | "build" | "private";
   path: string;
   cwd: string | null;
@@ -134,14 +117,15 @@ type AiTaskState = {
   emptyRetries: number;
   requestRetries: number;
   steps: AiTaskStep[];
-  busy: boolean;
   updatedAt: number;
 };
 const aiTasks = new Map<string, AiTaskState>();
 const AI_TASK_TTL_MS = 30 * 60 * 1000;
 const AI_TASK_MAX_TASKS = 100;
 const AI_MESSAGE_MAX_CHARS = 120_000;
-
+// Task ids with a runAiTask call in progress. Set before the first await so two
+// concurrent calls can never both restore and run the same queued command.
+const aiTasksInFlight = new Set<string>();
 
 function pruneAiTasks(): void {
   const now = Date.now();
@@ -159,7 +143,8 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
   state.messages.push(message);
   let total = state.messages.reduce((sum, item) => sum + item.content.length, 0);
   while (total > AI_MESSAGE_MAX_CHARS && state.messages.length > 2) {
-    const removableIndex = state.messages.findIndex((item, index) => index > 0 && item.role !== "system");
+    // [0] is the system prompt and [1] the task statement; never trim those.
+    const removableIndex = state.messages.findIndex((item, index) => index > 1 && item.role !== "system");
     if (removableIndex < 0) break;
     total -= state.messages[removableIndex]?.content.length ?? 0;
     state.messages.splice(removableIndex, 1);
@@ -167,29 +152,51 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
 }
 
 async function persistAiTaskState(db: Db, taskId: string, state: AiTaskState): Promise<void> {
-  await ensureAiAgentContextTable(db);
   await db.insert(schema.aiAgentContext).values({
     id: 1,
     taskId,
     root: state.root,
     path: state.path,
     pendingCommand: state.pendingCommand,
-    confirmToken: null,
     messagesJson: "[]",
-    stateJson: JSON.stringify({ ...state, busy: false }),
+    stateJson: JSON.stringify(state),
     updatedAt: new Date(),
   }).onConflictDoUpdate({ target: schema.aiAgentContext.id, set: {
     taskId,
     root: state.root,
     path: state.path,
     pendingCommand: state.pendingCommand,
-    confirmToken: null,
-    stateJson: JSON.stringify({ ...state, busy: false }),
+    stateJson: JSON.stringify(state),
     updatedAt: new Date(),
   } });
 }
 
-const AI_BASH_TOOL = { type: "function", function: { name: "bash", description: "Run one bash command in the sandbox. Read-only commands run automatically; mutating, deleting, moving, installing or permission-changing commands pause for user confirmation. Set done=true with an empty command when the task is complete.", parameters: { type: "object", properties: { command: { type: "string", description: "The bash command to run; empty when the task is done." }, explanation: { type: "string", description: "Short explanation for this step." }, done: { type: "boolean", description: "Whether the task is complete." } }, required: ["command", "explanation", "done"], additionalProperties: false } } };
+const AI_BASH_TOOL = { type: "function", function: { name: "bash", description: "Run one bash command in the sandbox. Commands that write, modify, move or delete files or data pause for user confirmation and may be rejected; other commands run automatically. Set done=true with an empty command when the task is complete.", parameters: { type: "object", properties: { command: { type: "string", description: "The bash command to run; empty when the task is done." }, explanation: { type: "string", description: "Short explanation for this step." }, done: { type: "boolean", description: "Whether the task is complete." } }, required: ["command", "explanation", "done"], additionalProperties: false } } };
+
+async function restoreAiTask(db: Db, taskId: string): Promise<AiTaskState | undefined> {
+  const [row] = await db.select().from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
+  if (row?.taskId !== taskId || !row.stateJson) return undefined;
+  try {
+    const restored = JSON.parse(row.stateJson) as AiTaskState;
+    if (!Array.isArray(restored.messages) || !Array.isArray(restored.steps)) return undefined;
+    // The token hash is not trusted across restarts; a fresh token is issued on demand.
+    const state: AiTaskState = { ...restored, pendingTokenHash: null, emptyRetries: restored.emptyRetries ?? 0, requestRetries: restored.requestRetries ?? 0, updatedAt: Date.now() };
+    aiTasks.set(taskId, state);
+    return state;
+  } catch {
+    await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
+    return undefined;
+  }
+}
+
+// Network failures, rate limits and server errors are worth retrying; a bad key,
+// a wrong model or unparseable output is not.
+function isTransientAiError(error: unknown): boolean {
+  if (error instanceof AiEmptyOutputError) return true;
+  if (!(error instanceof AiRequestError)) return false;
+  const { phase, status } = error.diagnostic;
+  return phase === "request" || (phase === "http" && status !== null && (status === 429 || status >= 500));
+}
 
 async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$inferSelect, messages: AiTaskMessage[], timeoutMs: number, includeTools = true): Promise<{ command: string; explanation: string; done: boolean }> {
   // Retries drop the tool declaration so models whose proxy mangles tool arguments
@@ -233,18 +240,6 @@ async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$infe
 }
 
 export const Actions = {
-  getFileAccess: defineAction({
-    request: z.object({ id: z.number().int().positive() }),
-    response: z.object({ ok: z.boolean(), message: z.string(), url: z.string().nullable(), name: z.string().nullable(), mimeType: z.string().nullable() }),
-    async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
-      const [item] = await db.select().from(schema.workspaceItems).where(and(eq(schema.workspaceItems.id, args.id), eq(schema.workspaceItems.kind, "file"))).limit(1);
-      if (!item?.blobKey) return { ok: false, message: "文件内容不可用。", url: null, name: null, mimeType: null };
-      const url = await ctx.blobs.getUrl(item.blobKey, { expiresInSeconds: 600 });
-      return { ok: true, message: "文件已准备好。", url, name: item.name, mimeType: item.mimeType };
-    },
-  }),
-
   migratePrivateWorkspace: defineAction({
     request: z.object({}),
     response: z.object({ ok: z.boolean(), message: z.string(), migrated: z.boolean(), path: z.string() }),
@@ -371,42 +366,43 @@ export const Actions = {
 
   getAiProviderConfig: defineAction({
     request: z.object({}),
-    response: z.object({ configured: z.boolean(), baseUrl: z.string(), model: z.string(), apiKey: z.string(), updatedAt: z.string().nullable() }),
+    response: z.object({ configured: z.boolean(), baseUrl: z.string(), model: z.string(), hasApiKey: z.boolean(), apiKeyHint: z.string(), updatedAt: z.string().nullable() }),
     async handler(ctx) {
+      // The key itself never leaves the server; the page only gets a masked hint.
       const config = await readAiConfig(ctx.db<typeof schema>());
-      return { configured: Boolean(config), baseUrl: config?.baseUrl ?? "https://api.openai.com", model: config?.model ?? "", apiKey: config?.apiKey ?? "", updatedAt: config?.updatedAt.toISOString() ?? null };
+      return { configured: Boolean(config), baseUrl: config?.baseUrl ?? "https://api.openai.com", model: config?.model ?? "", hasApiKey: Boolean(config?.apiKey), apiKeyHint: maskApiKey(config?.apiKey ?? ""), updatedAt: config?.updatedAt.toISOString() ?? null };
     },
   }),
 
   getAiContext: defineAction({
     request: z.object({}),
-    response: z.object({ ok: z.boolean(), taskId: z.string().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string(), pendingCommand: z.string(), confirmToken: z.string().nullable(), messages: z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })) }),
+    response: z.object({ ok: z.boolean(), taskId: z.string().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string(), pendingCommand: z.string(), messages: z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })) }),
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
-      await ensureAiAgentContextTable(db);
+      await ensureTables(db);
       const [row] = await db.select().from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
-      if (!row) return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", confirmToken: null, messages: [] };
+      if (!row) return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", messages: [] };
       try {
         const messages = JSON.parse(row.messagesJson) as unknown;
-        return { ok: true, taskId: row.taskId, root: row.root as "system" | "workspace" | "build" | "private", path: row.path, pendingCommand: row.pendingCommand, confirmToken: row.confirmToken, messages: Array.isArray(messages) ? messages : [] };
+        return { ok: true, taskId: row.taskId, root: row.root as "system" | "workspace" | "build" | "private", path: row.path, pendingCommand: row.pendingCommand, messages: Array.isArray(messages) ? messages : [] };
       } catch {
         await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
-        return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", confirmToken: null, messages: [] };
+        return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", messages: [] };
       }
     },
   }),
 
   saveAiContext: defineAction({
-    request: z.object({ taskId: z.string().uuid().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), pendingCommand: z.string().max(4000), confirmToken: z.string().max(128).nullable(), messages: z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(20000), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })).max(40) }),
+    request: z.object({ taskId: z.string().uuid().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), pendingCommand: z.string().max(4000), messages: z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(20000), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })).max(40) }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await ensureAiAgentContextTable(db);
+      await ensureTables(db);
       if (!args.messages.length && !args.taskId && !args.pendingCommand) {
         await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
         return { ok: true };
       }
-      await db.insert(schema.aiAgentContext).values({ id: 1, taskId: args.taskId, root: args.root, path: args.path, pendingCommand: args.pendingCommand, confirmToken: args.confirmToken, messagesJson: JSON.stringify(args.messages), updatedAt: new Date() }).onConflictDoUpdate({ target: schema.aiAgentContext.id, set: { taskId: args.taskId, root: args.root, path: args.path, pendingCommand: args.pendingCommand, confirmToken: args.confirmToken, messagesJson: JSON.stringify(args.messages), updatedAt: new Date() } });
+      await db.insert(schema.aiAgentContext).values({ id: 1, taskId: args.taskId, root: args.root, path: args.path, pendingCommand: args.pendingCommand, messagesJson: JSON.stringify(args.messages), updatedAt: new Date() }).onConflictDoUpdate({ target: schema.aiAgentContext.id, set: { taskId: args.taskId, root: args.root, path: args.path, pendingCommand: args.pendingCommand, messagesJson: JSON.stringify(args.messages), updatedAt: new Date() } });
       return { ok: true };
     },
   }),
@@ -416,7 +412,7 @@ export const Actions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
-      await ensureAiAgentContextTable(db);
+      await ensureTables(db);
       const [row] = await db.select({ taskId: schema.aiAgentContext.taskId }).from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
       if (row?.taskId) aiTasks.delete(row.taskId);
       await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
@@ -426,149 +422,159 @@ export const Actions = {
 
   saveAiProviderConfig: defineAction({
     request: z.object({ baseUrl: z.string().url().max(500), apiKey: z.string().max(500), model: z.string().min(1).max(200) }),
-    response: z.object({ ok: z.boolean(), message: z.string(), models: z.array(z.string()) }),
+    response: z.object({ ok: z.boolean(), message: z.string() }),
     async handler(ctx, args) {
       let baseUrl: string;
       try { baseUrl = requirePublicBaseUrl(args.baseUrl); } catch (error) {
-        return { ok: false, message: error instanceof Error ? error.message : "模型地址无效。", models: [] };
+        return { ok: false, message: error instanceof Error ? error.message : "模型地址无效。" };
       }
       const db = ctx.db<typeof schema>();
+      // An empty key keeps the saved one, since the page never receives it.
+      const apiKey = args.apiKey.trim() || (await readAiConfig(db))?.apiKey || "";
+      if (!apiKey) return { ok: false, message: "请填写 API Key。" };
       const now = new Date();
-      await db.insert(schema.aiProviderConfig).values({ id: 1, baseUrl, apiKey: args.apiKey, model: args.model, updatedAt: now }).onConflictDoUpdate({ target: schema.aiProviderConfig.id, set: { baseUrl, apiKey: args.apiKey, model: args.model, updatedAt: now } });
-      return { ok: true, message: "AI 配置已保存到服务器。", models: [] };
+      await db.insert(schema.aiProviderConfig).values({ id: 1, baseUrl, apiKey, model: args.model, updatedAt: now }).onConflictDoUpdate({ target: schema.aiProviderConfig.id, set: { baseUrl, apiKey, model: args.model, updatedAt: now } });
+      return { ok: true, message: "AI 配置已保存到服务器。" };
     },
   }),
 
   listAiModels: defineAction({
     request: z.object({ baseUrl: z.string().url().max(500), apiKey: z.string().max(500) }),
     response: z.object({ ok: z.boolean(), message: z.string(), models: z.array(z.string()) }),
-    async handler(_ctx, args) {
+    async handler(ctx, args) {
       let baseUrl: string;
-      try { baseUrl = requirePublicBaseUrl(args.baseUrl); } catch (error) {
+      try {
+        baseUrl = requirePublicBaseUrl(args.baseUrl);
+        await assertPublicResolution(baseUrl);
+      } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "模型地址无效。", models: [] };
       }
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
+      const apiKey = args.apiKey.trim() || (await readAiConfig(ctx.db<typeof schema>()))?.apiKey || "";
+      if (!apiKey) return { ok: false, message: "请填写 API Key。", models: [] };
+      const signal = AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS);
       try {
-        const response = await fetch(`${baseUrl}/models`, { headers: { Authorization: `Bearer ${args.apiKey}` }, signal: controller.signal, redirect: "error" });
-        const body = await response.json() as { data?: Array<{ id?: string }> };
+        const response = await fetch(`${baseUrl}/models`, { headers: { Authorization: `Bearer ${apiKey}` }, signal, redirect: "error" });
+        const raw = await response.text();
+        if (!response.ok) return { ok: false, message: `模型列表读取失败（HTTP ${response.status}）：${raw.slice(0, 300)}`, models: [] };
+        let body: { data?: Array<{ id?: string }> };
+        try { body = JSON.parse(raw) as typeof body; } catch { return { ok: false, message: `模型列表接口返回的不是 JSON：${raw.slice(0, 300)}`, models: [] }; }
         const models = (body.data ?? []).map((item) => item.id ?? "").filter(Boolean).sort();
-        return { ok: response.ok, message: response.ok ? `已读取 ${models.length} 个模型。` : "模型列表读取失败。", models };
+        return { ok: true, message: `已读取 ${models.length} 个模型。`, models };
       } catch (error) {
-        return { ok: false, message: controller.signal.aborted ? `模型接口超过 ${AI_REQUEST_TIMEOUT_MS / 1000} 秒未响应，已中止。` : `无法连接模型服务：${error instanceof Error ? error.message : "未知错误"}`, models: [] };
-      } finally { clearTimeout(timer); }
+        return { ok: false, message: signal.aborted ? `模型接口超过 ${AI_REQUEST_TIMEOUT_MS / 1000} 秒未响应，已中止。` : `无法连接模型服务：${error instanceof Error ? error.message : "未知错误"}`, models: [] };
+      }
     },
   }),
 
   runAiTask: defineAction({
-    request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), confirmToken: z.string().max(128).nullable().default(null) }),
+    request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().max(4000).default(""), reject: z.boolean().default(false), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), confirmToken: z.string().max(128).nullable().default(null) }),
     response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable(), confirmToken: z.string().nullable(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable() }),
     privileged: [privileged.executeShell],
     async handler(ctx, args) {
-      pruneAiTasks();
-      // One call performs at most one model turn plus one command. A multi-step
+      // One call performs at most one model turn or one command. A multi-step
       // agent loop inside a single request would exceed the platform gateway
       // timeout ("Gateway request timed out"), so the client re-invokes this action
       // with the same taskId until the task completes.
-      const db = ctx.db<typeof schema>();
-      await ensureAiAgentContextTable(db);
-      const config = await readAiConfig(db);
-      if (!config) return { ok: false, taskId: args.taskId ?? crypto.randomUUID(), status: "failed" as const, message: "请先配置 AI 服务。", steps: [], pendingCommand: null, confirmToken: null, diagnostic: null };
-      const owner = "default";
+      pruneAiTasks();
       const taskId = args.taskId ?? crypto.randomUUID();
-      let state = args.taskId ? aiTasks.get(args.taskId) : undefined;
-      if (!state && args.taskId) {
-        const [row] = await db.select().from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
-        if (row?.taskId === args.taskId && row.stateJson) {
-          try {
-            const restored = JSON.parse(row.stateJson) as AiTaskState;
-            if (restored.configId === config.id && restored.owner === owner && Array.isArray(restored.messages) && Array.isArray(restored.steps)) {
-              state = { ...restored, busy: false, updatedAt: Date.now(), emptyRetries: restored.emptyRetries ?? 0, requestRetries: restored.requestRetries ?? 0, pendingTokenHash: restored.pendingCommand ? null : restored.pendingTokenHash };
-              aiTasks.set(taskId, state);
-            }
-          } catch {
-            await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
-          }
-        }
-      }
-      if (state && (state.owner !== owner || state.configId !== config.id)) {
-        return { ok: false, taskId, status: "failed" as const, message: "任务不存在、已过期，或模型配置已变更，请重新发起。", steps: [], pendingCommand: null, confirmToken: null, diagnostic: null };
-      }
-      if (state?.busy) return { ok: false, taskId, status: "running" as const, message: "任务正在执行，请等待当前步骤完成。", steps: state.steps, pendingCommand: state.pendingCommand || null, confirmToken: null, diagnostic: null };
-      if (!state) {
-        state = { configId: config.id, owner, root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, emptyRetries: 0, requestRetries: 0, steps: [], busy: false, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。只读、搜索、检查、测试命令可以自动执行；修改、删除、移动、安装、权限变更命令会暂停等待用户确认。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${args.prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
-        aiTasks.set(taskId, state);
-        pruneAiTasks();
-      }
-      state.busy = true;
-      state.updatedAt = Date.now();
+      let state: AiTaskState | undefined = aiTasks.get(taskId);
+      type Status = "running" | "waiting_confirmation" | "completed" | "failed";
+      const reply = (status: Status, message: string, extra: { pendingCommand?: string | null; confirmToken?: string | null; diagnostic?: AiDiagnostic | null; ok?: boolean } = {}) => ({ ok: extra.ok ?? status !== "failed", taskId, status, message, steps: state?.steps ?? [], pendingCommand: extra.pendingCommand ?? null, confirmToken: extra.confirmToken ?? null, diagnostic: extra.diagnostic ?? null });
+      if (aiTasksInFlight.has(taskId)) return reply("running", "任务正在执行，请等待当前步骤完成。", { ok: false, pendingCommand: state?.pendingCommand || null });
+      aiTasksInFlight.add(taskId);
+      const db = ctx.db<typeof schema>();
       try {
-        // Each call does exactly one thing: run the queued command, or ask the model
-        // for the next one. Keeping the two apart caps a request at the model timeout
-        // or the shell timeout instead of their sum, so the platform gateway does not
-        // abort it with "Gateway request timed out".
-        if (state.pendingCommand) {
-          const isAutoRun = state.pendingAutoRun;
-          if (!isAutoRun) {
-            const providedHash = args.confirmToken ? digestToken(args.confirmToken) : "";
-            if (!state.pendingTokenHash) {
-              const token = randomToken();
-              state.pendingTokenHash = digestToken(token);
-              return { ok: true, taskId, status: "waiting_confirmation" as const, message: "这一步需要用户确认后才能执行。", steps: state.steps, pendingCommand: state.pendingCommand, confirmToken: token, diagnostic: null };
-            }
-            if (!providedHash || !constantTimeEqual(providedHash, state.pendingTokenHash)) {
-              return { ok: true, taskId, status: "waiting_confirmation" as const, message: "这一步需要用户确认后才能执行。", steps: state.steps, pendingCommand: state.pendingCommand, confirmToken: null, diagnostic: null };
-            }
+        const config = await readAiConfig(db);
+        if (!config) return reply("failed", "请先配置 AI 服务。");
+        const prompt = args.prompt.trim();
+        if (!state && args.taskId) state = await restoreAiTask(db, args.taskId);
+        if (!state) {
+          if (args.taskId) return reply("failed", "任务不存在或已过期，请重新发起。");
+          if (!prompt) return reply("failed", "请先描述要完成的任务。");
+          state = { root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, emptyRetries: 0, requestRetries: 0, steps: [], updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。会写入、修改、移动或删除文件和数据的命令会暂停等待用户确认，用户可能拒绝；其他命令自动执行。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
+          aiTasks.set(taskId, state);
+          pruneAiTasks();
+        } else if (args.reject || prompt) {
+          // A rejection, or a message typed while a command waits, replaces the
+          // pending command with the user's feedback.
+          if (state.pendingCommand) {
+            pushAiMessage(state, { role: "user", content: `用户拒绝执行命令：${state.pendingCommand}${prompt ? "" : "\n请换一种不需要该操作的方式继续，或在无法继续时结束任务。"}` });
+            state.pendingCommand = "";
+            state.pendingTokenHash = null;
+            state.pendingAutoRun = false;
           }
-          const queuedCommand = state.pendingCommand;
-          state.pendingCommand = "";
-          state.pendingTokenHash = null;
-          state.pendingAutoRun = false;
-          pushAiMessage(state, { role: "user", content: isAutoRun ? `执行命令：${queuedCommand}` : `用户已确认执行待执行命令：${queuedCommand}` });
-          const result = await ctx.executePrivileged(privileged.executeShell, { command: queuedCommand, root: state.root, path: state.path, cwd: state.cwd, runAsRoot: state.runAsRoot });
-          state.cwd = result.cwd;
-          state.steps.push({ command: queuedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: !isAutoRun });
-          pushAiMessage(state, { role: "user", content: `命令：${queuedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
-          if (result.exitCode !== 0) pushAiMessage(state, { role: "user", content: "这条命令执行失败。请分析终端错误，自动修正命令并继续任务，不要等待用户重复提交。" });
-          return { ok: true, taskId, status: "running" as const, message: "命令已执行，继续下一步。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
+          if (prompt) pushAiMessage(state, { role: "user", content: `用户补充要求：${prompt}` });
         }
-        let next: { command: string; explanation: string; done: boolean };
+        const task = state;
+        task.updatedAt = Date.now();
         try {
-          next = await requestNextAiCommand(config, state.messages, AI_AGENT_REQUEST_TIMEOUT_MS, state.emptyRetries === 0 && state.requestRetries === 0);
-        } catch (error) {
-          // Retry bounded model/network/protocol failures before surfacing the
-          // diagnostic. Empty output also gets the plain-JSON fallback prompt.
-          if (state.requestRetries < 2) {
-            state.requestRetries += 1;
-            if (error instanceof AiEmptyOutputError) state.emptyRetries += 1;
-            pushAiMessage(state, { role: "user", content: error instanceof AiEmptyOutputError ? "上一次回复没有可执行内容。请只输出一个 JSON 对象：{\"command\":\"...\",\"explanation\":\"...\",\"done\":false}，不要使用工具调用，不要留空参数。" : "上一次模型请求失败。请自动重试并继续任务，只输出一个 JSON 对象。" });
-            return { ok: true, taskId, status: "running" as const, message: `模型请求失败，已自动重试（${state.requestRetries}/2）。`, steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null };
+          // Each call does exactly one thing: run the queued command, or ask the model
+          // for the next one. Keeping the two apart caps a request at the model timeout
+          // or the shell timeout instead of their sum.
+          if (task.pendingCommand) {
+            const isAutoRun = task.pendingAutoRun;
+            if (!isAutoRun) {
+              const confirmed = Boolean(args.confirmToken && task.pendingTokenHash && constantTimeEqual(digestToken(args.confirmToken), task.pendingTokenHash));
+              if (!confirmed) {
+                // A fresh single-use token for the current pending command; any earlier token stops working.
+                const token = randomToken();
+                task.pendingTokenHash = digestToken(token);
+                return reply("waiting_confirmation", "这一步需要用户确认后才能执行。", { pendingCommand: task.pendingCommand, confirmToken: token });
+              }
+            }
+            const queuedCommand = task.pendingCommand;
+            task.pendingCommand = "";
+            task.pendingTokenHash = null;
+            task.pendingAutoRun = false;
+            pushAiMessage(task, { role: "user", content: isAutoRun ? `执行命令：${queuedCommand}` : `用户已确认执行待执行命令：${queuedCommand}` });
+            const result = await ctx.executePrivileged(privileged.executeShell, { command: queuedCommand, root: task.root, path: task.path, cwd: task.cwd, runAsRoot: task.runAsRoot });
+            task.cwd = result.cwd;
+            task.steps.push({ command: queuedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: !isAutoRun });
+            pushAiMessage(task, { role: "user", content: `命令：${queuedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
+            if (result.exitCode !== 0) pushAiMessage(task, { role: "user", content: "这条命令执行失败。请分析终端错误，自动修正命令并继续任务，不要等待用户重复提交。" });
+            return reply("running", "命令已执行，继续下一步。");
           }
-          throw error;
+          let next: { command: string; explanation: string; done: boolean };
+          try {
+            next = await requestNextAiCommand(config, task.messages, AI_AGENT_REQUEST_TIMEOUT_MS, task.emptyRetries === 0);
+          } catch (error) {
+            if (task.requestRetries < 2 && isTransientAiError(error)) {
+              task.requestRetries += 1;
+              if (error instanceof AiEmptyOutputError) {
+                // Only the model saw an empty answer, so only then does it get a correction.
+                task.emptyRetries += 1;
+                pushAiMessage(task, { role: "user", content: "上一次回复没有可执行内容。请只输出一个 JSON 对象：{\"command\":\"...\",\"explanation\":\"...\",\"done\":false}，不要使用工具调用，不要留空参数。" });
+              }
+              return reply("running", `模型请求失败，已自动重试（${task.requestRetries}/2）。`);
+            }
+            throw error;
+          }
+          task.requestRetries = 0;
+          task.emptyRetries = 0;
+          if (next.done && !next.command) { aiTasks.delete(taskId); return reply("completed", next.explanation || "任务已完成。"); }
+          if (!next.command) throw new Error("模型没有返回可执行命令，且未标记任务完成。");
+          // done=true with a command: run the command first rather than dropping it.
+          const assessment = assessCommand(next.command);
+          pushAiMessage(task, { role: "assistant", content: JSON.stringify({ ...next, done: false }) });
+          task.pendingCommand = next.command;
+          if (assessment.requiresConfirmation) {
+            const token = randomToken();
+            task.pendingTokenHash = digestToken(token);
+            task.pendingAutoRun = false;
+            return reply("waiting_confirmation", next.explanation ? `${next.explanation}（需要确认：${assessment.reason}）` : `这一步需要确认：${assessment.reason}`, { pendingCommand: next.command, confirmToken: token });
+          }
+          task.pendingTokenHash = null;
+          task.pendingAutoRun = true;
+          return reply("running", next.explanation || "准备执行命令。", { pendingCommand: next.command });
+        } catch (error) {
+          aiTasks.delete(taskId);
+          return reply("failed", `AI Agent 执行失败：${error instanceof Error ? error.message : "未知错误"}`, { diagnostic: describeAiError(error) });
+        } finally {
+          task.updatedAt = Date.now();
+          await persistAiTaskState(db, taskId, task);
         }
-        state.requestRetries = 0;
-        state.emptyRetries = 0;
-        if (next.done) { aiTasks.delete(taskId); return { ok: true, taskId, status: "completed" as const, message: next.explanation || "任务已完成。", steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: null }; }
-        if (!next.command) throw new Error("模型没有返回可执行命令，且未标记任务完成。");
-        const assessment = assessCommand(next.command);
-        pushAiMessage(state, { role: "assistant", content: JSON.stringify(next) });
-        state.pendingCommand = next.command;
-        if (assessment.requiresConfirmation) {
-          const token = randomToken();
-          state.pendingTokenHash = digestToken(token);
-          state.pendingAutoRun = false;
-          return { ok: true, taskId, status: "waiting_confirmation" as const, message: next.explanation || `这一步需要确认：${assessment.reason}`, steps: state.steps, pendingCommand: next.command, confirmToken: token, diagnostic: null };
-        }
-        state.pendingTokenHash = null;
-        state.pendingAutoRun = true;
-        return { ok: true, taskId, status: "running" as const, message: next.explanation || "准备执行命令。", steps: state.steps, pendingCommand: next.command, confirmToken: null, diagnostic: null };
-      } catch (error) {
-        aiTasks.delete(taskId);
-        return { ok: false, taskId, status: "failed" as const, message: `AI Agent 执行失败：${error instanceof Error ? error.message : "未知错误"}`, steps: state.steps, pendingCommand: null, confirmToken: null, diagnostic: describeAiError(error) };
       } finally {
-        state.busy = false;
-        state.updatedAt = Date.now();
-        await persistAiTaskState(db, taskId, state);
+        aiTasksInFlight.delete(taskId);
       }
     },
   }),
@@ -579,26 +585,6 @@ export const Actions = {
     privileged: [privileged.executeShell],
     async handler(ctx, args) { return ctx.executePrivileged(privileged.executeShell, args); },
   }),
-
-  generateAiShellCommand: defineAction({
-    request: z.object({ prompt: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000) }),
-    response: z.object({ ok: z.boolean(), message: z.string(), command: z.string(), explanation: z.string(), requiresConfirmation: z.boolean() }),
-    async handler(ctx, args) {
-      const config = await readAiConfig(ctx.db<typeof schema>());
-      if (!config) return { ok: false, message: "请先配置 AI 服务。", command: "", explanation: "", requiresConfirmation: false };
-      try {
-        const response = await aiFetch(config, "/chat/completions", { method: "POST", body: JSON.stringify({ model: config.model, temperature: 0.1, messages: [{ role: "system", content: "你是沙盒终端助手。只生成一条 bash 命令，不要执行。返回 JSON：{command:string, explanation:string}，不要 Markdown 代码块。当前工作区根类型和相对路径会由用户提供。优先使用只读命令；修改、删除、移动、安装、权限变更命令必须明确说明。" }, { role: "user", content: `目标：${args.prompt}\n工作区根类型：${args.root}\n相对路径：${args.path || "/"}` }] }) });
-        const raw = await response.text();
-        if (!response.ok) throw new Error(`模型接口 ${response.status}: ${raw.slice(0, 500)}`);
-        const body = JSON.parse(raw) as { choices?: Array<{ message?: { content?: string } }> };
-        const parsed = parseAiCommandContent(body.choices?.[0]?.message?.content ?? "");
-        const command = parsed.command.trim();
-        if (!command) return { ok: false, message: "模型没有返回可执行命令。", command: "", explanation: "", requiresConfirmation: false };
-        return { ok: true, message: "命令已生成。", command, explanation: parsed.explanation, requiresConfirmation: assessCommand(command).requiresConfirmation };
-      } catch (error) { return { ok: false, message: `AI 请求失败：${error instanceof Error ? error.message : "未知错误"}`, command: "", explanation: "", requiresConfirmation: false }; }
-    },
-  }),
-
 
   getSystemSnapshot: defineAction({
     request: z.object({}),

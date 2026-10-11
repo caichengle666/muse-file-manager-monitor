@@ -146,12 +146,15 @@ export function App() {
   const agentMirrorRef = useRef(0);
   const hostUploadRef = useRef<HTMLInputElement>(null);
 
+  const privateMigratedRef = useRef(false);
+
   const hostQuery = useQuery({
     queryKey: ["host-directory", fileMode, hostPath, showSensitive],
     queryFn: async () => {
-      if (fileMode === "private") {
+      if (fileMode === "private" && !privateMigratedRef.current) {
         const migration = await api.migratePrivateWorkspace({});
         if (!migration.ok) throw new Error(migration.message);
+        privateMigratedRef.current = true;
       }
       return api.listHostDirectory({ root: fileMode, path: hostPath, showSensitive });
     },
@@ -486,6 +489,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   const [aiBusy, setAiBusy] = useState(false);
   const [aiBaseUrl, setAiBaseUrl] = useState("https://api.openai.com");
   const [aiApiKey, setAiApiKey] = useState("");
+  const [aiKeyHint, setAiKeyHint] = useState("");
   const [aiModel, setAiModel] = useState("");
   const [aiModels, setAiModels] = useState<string[]>([]);
   const [aiConfigured, setAiConfigured] = useState(false);
@@ -502,23 +506,25 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   const chatRef = useRef<HTMLDivElement>(null);
   useEffect(() => { outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight }); }, [entries, busy]);
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight }); }, [agentMessages, aiBusy]);
-  useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiApiKey(result.apiKey); setAiModel(result.model); setAiConfigured(result.configured); setAiConfigOpen(!result.configured); }); }, []);
-  useEffect(() => { void api.getAiContext({}).then((result) => { setRoot(result.root); setPath(result.path); setAgentTaskId(result.taskId); setAgentPending(result.pendingCommand); setAgentToken(result.confirmToken); setAgentMessages(result.messages); agentStepCountRef.current = result.messages.reduce((count, message) => count + (message.steps?.length ?? 0), 0); setAgentContextLoaded(true); }); }, []);
-  useEffect(() => { if (!agentContextLoaded) return; void api.saveAiContext({ taskId: agentTaskId, root, path, pendingCommand: agentPending, confirmToken: agentToken, messages: agentMessages }); }, [agentContextLoaded, agentMessages, agentPending, agentTaskId, agentToken, path, root]);
+  useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiKeyHint(result.hasApiKey ? result.apiKeyHint : ""); setAiModel(result.model); setAiConfigured(result.configured); setAiConfigOpen(!result.configured); }); }, []);
+  useEffect(() => { void api.getAiContext({}).then((result) => { setRoot(result.root); setPath(result.path); setAgentTaskId(result.taskId); setAgentPending(result.pendingCommand); setAgentMessages(result.messages); agentStepCountRef.current = result.messages.reduce((count, message) => count + (message.steps?.length ?? 0), 0); setAgentContextLoaded(true); }); }, []);
+  useEffect(() => { if (!agentContextLoaded) return; void api.saveAiContext({ taskId: agentTaskId, root, path, pendingCommand: agentPending, messages: agentMessages }); }, [agentContextLoaded, agentMessages, agentPending, agentTaskId, path, root]);
   function submit(event: FormEvent) { event.preventDefault(); const value = command.trim(); if (!value || busy) return; setCommand(""); void onRun(value, root, path); }
+  const aiKeyAvailable = Boolean(aiApiKey.trim() || aiKeyHint);
   async function saveAi() {
-    if (!aiApiKey.trim() || !aiModel.trim()) return;
+    if (!aiKeyAvailable || !aiModel.trim()) return;
     setAiBusy(true);
     try {
       const result = await api.saveAiProviderConfig({ baseUrl: aiBaseUrl, apiKey: aiApiKey, model: aiModel });
       setAiConfigured(result.ok);
+      if (result.ok) { const config = await api.getAiProviderConfig({}); setAiKeyHint(config.hasApiKey ? config.apiKeyHint : ""); setAiApiKey(""); }
       appendAgentMessage({ role: "assistant", text: result.ok ? "模型配置已保存到服务器。" : `保存配置失败：${result.message}` });
     } catch (error) {
       appendAgentMessage({ role: "assistant", text: `保存配置失败：${error instanceof Error ? error.message : "未知错误"}` });
     } finally { setAiBusy(false); }
   }
   async function pullModels() {
-    if (!aiApiKey.trim()) return;
+    if (!aiKeyAvailable) return;
     setAiBusy(true);
     try {
       const result = await api.listAiModels({ baseUrl: aiBaseUrl, apiKey: aiApiKey });
@@ -541,20 +547,26 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
       agentStepCountRef.current = 0;
     } finally { setAiBusy(false); }
   }
-  async function runAgent(confirmToken?: string) {
-    const task = agentPrompt.trim();
+  async function runAgent(options: { confirmToken?: string; reject?: boolean } = {}) {
+    if (aiBusy) return;
+    const confirming = Boolean(options.confirmToken);
+    const task = confirming ? "" : agentPrompt.trim();
     if (!task && !agentTaskId) return;
     setAgentExpanded(true);
-    if (!confirmToken && task) appendAgentMessage({ role: "user", text: task });
+    if (task) appendAgentMessage({ role: "user", text: task });
+    if (options.reject) appendAgentMessage({ role: "assistant", text: `已拒绝执行：${agentPending}` });
+    if (!confirming) setAgentPrompt("");
     setAiBusy(true);
     let activeTaskId = agentTaskId;
-    let nextToken = confirmToken ?? null;
+    let request = { prompt: task, reject: Boolean(options.reject), confirmToken: options.confirmToken ?? null };
+    const maxRounds = 40;
     try {
       // Each server call handles exactly one model turn or one command, so the
       // gateway never sees a multi-minute request. Keep driving the loop here until
       // the task finishes or needs user confirmation.
-      for (let round = 0; round < 40; round += 1) {
-        const result = await api.runAiTask({ taskId: activeTaskId, prompt: task || "继续当前任务", root, path, confirmToken: nextToken });
+      for (let round = 0; round < maxRounds; round += 1) {
+        const result = await api.runAiTask({ taskId: activeTaskId, root, path, ...request });
+        request = { prompt: "", reject: false, confirmToken: null };
         const newSteps = result.steps.slice(agentStepCountRef.current);
         agentStepCountRef.current = result.steps.length;
         activeTaskId = result.status === "completed" || result.status === "failed" ? null : result.taskId;
@@ -563,23 +575,41 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
         setAgentToken(result.confirmToken ?? null);
         if (newSteps.length > 0 || result.status !== "running") appendAgentMessage({ role: "assistant", text: result.message || (result.status === "completed" ? "任务已完成。" : ""), steps: newSteps, diagnostic: result.diagnostic ?? null });
         onAgentSteps(result.steps);
-        nextToken = null;
-        if (result.status === "completed" || result.status === "failed") { setAgentPrompt(""); setAgentToken(null); agentStepCountRef.current = 0; break; }
+        if (result.status === "completed" || result.status === "failed") { agentStepCountRef.current = 0; break; }
         if (result.status === "waiting_confirmation") break;
+        if (round === maxRounds - 1) appendAgentMessage({ role: "assistant", text: `已达到单次 ${maxRounds} 轮（约 ${maxRounds / 2} 步）的上限，任务暂停。点「继续」接着执行。` });
       }
     } catch (error) {
       appendAgentMessage({ role: "assistant", text: `请求失败：${error instanceof Error ? error.message : "未知错误"}` });
     } finally { setAiBusy(false); }
   }
+  async function confirmPending() {
+    if (aiBusy || !agentTaskId) return;
+    let token = agentToken;
+    if (!token) {
+      // After a reload the page has the pending command but no token; ask the
+      // server for a fresh one, and only use it if the command is unchanged.
+      const result = await api.runAiTask({ taskId: agentTaskId, root, path, prompt: "", reject: false, confirmToken: null });
+      if (result.status !== "waiting_confirmation" || !result.confirmToken || result.pendingCommand !== agentPending) {
+        setAgentPending(result.status === "waiting_confirmation" ? result.pendingCommand ?? "" : "");
+        setAgentToken(result.confirmToken ?? null);
+        if (result.status === "failed") setAgentTaskId(null);
+        appendAgentMessage({ role: "assistant", text: result.status === "waiting_confirmation" ? "待执行命令已变化，请重新确认。" : result.message });
+        return;
+      }
+      token = result.confirmToken;
+    }
+    await runAgent({ confirmToken: token });
+  }
   return <section className="terminal-panel" aria-label="终端">
-    <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 30 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
+    <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 25 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
     <div className={`terminal-location ${locationOpen ? "is-open" : "is-collapsed"}`}><button type="button" className="terminal-location-toggle" onClick={() => setLocationOpen((open) => !open)} aria-expanded={locationOpen}>执行位置 <span>{root === "workspace" ? "工作区" : root} · {path || "根目录"}</span><b>{locationOpen ? "收起" : "展开"}</b></button><div className="terminal-location-fields"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div></div>
     <div id="ai-agent-panel" className={`ai-terminal-panel ${agentExpanded ? "is-expanded" : "is-collapsed"}`}>
       <div className="ai-terminal-heading">
         <div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div>
         <div className="ai-terminal-heading-actions"><span>自动读取输出并继续 · 改删操作确认</span><button type="button" className="ai-panel-toggle" onClick={() => setAgentExpanded((expanded) => !expanded)} aria-expanded={agentExpanded} aria-controls="ai-agent-panel">{agentExpanded ? "收起对话" : "展开对话"}</button><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>{aiConfigOpen ? "收起配置" : "模型配置"}</button></div>
       </div>
-      {aiConfigOpen && <div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="text" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder="API Key" /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiApiKey.trim()}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiApiKey.trim() || !aiModel.trim()}>保存配置</button></div>}
+      {aiConfigOpen && <div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="password" autoComplete="off" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={aiKeyHint ? `API Key 已保存（${aiKeyHint}），留空则不变` : "API Key"} /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiKeyAvailable}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiKeyAvailable || !aiModel.trim()}>保存配置</button></div>}
       <div className="agent-chat" ref={chatRef} role="log" aria-live="polite">
         {!agentMessages.length && <div className="agent-chat-empty">描述一个任务，AI 会逐步执行，并把每一步的命令、输出和结论发在这里。</div>}
         {agentMessages.map((message, index) => <div className={`agent-message ${message.role}`} key={index}>
@@ -599,8 +629,8 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
         </div>)}
         {aiBusy && <div className="agent-message assistant pending"><div className="agent-message-role">AI</div><div className="agent-message-text">正在思考并执行下一步…</div></div>}
       </div>
-      {agentPending && <div className="ai-command-preview"><code>{agentPending}</code><button type="button" onClick={() => agentToken ? void runAgent(agentToken) : undefined} disabled={!agentToken}>确认并执行</button></div>}
-      <form className="ai-terminal-prompt" onSubmit={(event) => { event.preventDefault(); if (aiBusy || !agentPrompt.trim()) return; void runAgent(); }}><input value={agentPrompt} onChange={(event) => setAgentPrompt(event.target.value)} placeholder={agentTaskId ? "继续补充要求，或直接发送继续" : "描述一个完整任务，例如：检查项目错误并修复，然后运行测试"} /><button type="submit" disabled={aiBusy || !agentPrompt.trim()}>{aiBusy ? "执行中" : agentTaskId ? "继续" : "发送"}</button></form>
+      {agentPending && <div className="ai-command-preview"><code>{agentPending}</code><button type="button" onClick={() => void confirmPending()} disabled={aiBusy}>确认并执行</button><button type="button" className="ai-command-reject" onClick={() => void runAgent({ reject: true })} disabled={aiBusy}>拒绝</button></div>}
+      <form className="ai-terminal-prompt" onSubmit={(event) => { event.preventDefault(); void runAgent(); }}><input value={agentPrompt} onChange={(event) => setAgentPrompt(event.target.value)} placeholder={agentPending ? "输入修改意见会替代待确认命令" : agentTaskId ? "继续补充要求，或直接发送继续" : "描述一个完整任务，例如：检查项目错误并修复，然后运行测试"} /><button type="submit" disabled={aiBusy || (!agentPrompt.trim() && !agentTaskId)}>{aiBusy ? "执行中" : agentTaskId ? "继续" : "发送"}</button></form>
     </div>
     <div className="terminal-output" ref={outputRef} role="log" aria-live="polite">
       {!entries.length && <div className="terminal-empty">在下方输入命令。命令以当前运行用户身份执行，输出最多保留 1 MB。</div>}

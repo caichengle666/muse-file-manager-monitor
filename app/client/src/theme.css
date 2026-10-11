@@ -489,9 +489,10 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .ai-terminal-config input, .ai-terminal-config select, .ai-terminal-prompt input { min-width: 0; height: 34px; padding: 6px 8px; border: 1px solid #42534c; border-radius: 4px; background: #0d1411; color: #dce8df; font: 10px/1.2 "IBM Plex Mono", ui-monospace, monospace; }
 .ai-terminal-config button, .ai-terminal-prompt button, .ai-command-preview button { min-height: 34px; padding: 6px 10px; border: 1px solid #52665b; border-radius: 4px; background: #24322b; color: #dce8df; font-size: 11px; font-weight: 700; cursor: pointer; }
 .ai-terminal-prompt button, .ai-command-preview button { border-color: #b7f34a; background: #b7f34a; color: #0b1108; }
-.ai-command-preview { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 10px; align-items: center; padding: 9px 10px; border: 1px solid #52665b; background: #0d1411; }
+.ai-command-preview { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 5px 10px; align-items: center; padding: 9px 10px; border: 1px solid #52665b; background: #0d1411; }
 .ai-command-preview code { overflow-wrap: anywhere; color: #b7f34a; font: 12px/1.45 "IBM Plex Mono", ui-monospace, monospace; }
 .ai-command-preview small { grid-column: 1; color: #8fa098; font-size: 10px; }
+.ai-command-preview .ai-command-reject { border-color: #52665b; background: #24322b; color: #dce8df; }
 .agent-chat { flex: 1 1 auto; }
 .ai-terminal-heading, .ai-terminal-config, .ai-terminal-prompt, .ai-command-preview { flex: 0 0 auto; }
 

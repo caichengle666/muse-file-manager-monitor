@@ -1,5 +1,6 @@
 import {
   accessSync,
+  chownSync,
   closeSync,
   constants,
   existsSync,
@@ -17,11 +18,11 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { exec, execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { cpus, homedir, hostname, loadavg, platform, release, uptime, userInfo } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { definePrivilegedContracts, definePrivilegedHandlers, z } from "@hatch/space-sdk";
-import { selectShellExecutionMode } from "./shellExecution";
+import { SHELL_TIMEOUT_MS, selectShellExecutionMode, shellSpawnArgs } from "./shellExecution";
 
 export const privileged = definePrivilegedContracts({
   listHostDirectory: {
@@ -103,7 +104,7 @@ export const privileged = definePrivilegedContracts({
   readSystemSnapshot: {
     request: z.object({}),
     response: z.object({
-      sampledAt: z.string(), platform: z.string(), hostname: z.string(), kernelVersion: z.string(), uptimeSec: z.number(), serviceUptimeSec: z.number(), bootedAt: z.string(), serviceStartedAt: z.string(), cpuPercent: z.number(), cpuCores: z.array(z.object({ name: z.string(), percent: z.number() })), loadAverage: z.array(z.number()).length(3),
+      sampledAt: z.string(), platform: z.string(), hostname: z.string(), kernelVersion: z.string(), uptimeSec: z.number(), bootedAt: z.string(), cpuPercent: z.number(), cpuCores: z.array(z.object({ name: z.string(), percent: z.number() })), loadAverage: z.array(z.number()).length(3),
       memory: z.object({ total: z.number(), used: z.number(), cached: z.number(), buffers: z.number(), available: z.number(), percent: z.number() }),
       mounts: z.array(z.object({ path: z.string(), total: z.number(), used: z.number(), available: z.number(), percent: z.number() })),
       disks: z.array(z.object({ name: z.string(), readPerSec: z.number(), writePerSec: z.number() })),
@@ -224,6 +225,19 @@ function resolveExisting(start: string, raw: string, showSensitive: boolean): { 
     const parts = checkPath.split("/").filter(Boolean);
     if (parts.some((part) => !showSensitive && blockedNames.test(part))) return null;
     return { absolute, relativePath: absolute };
+  } catch { return null; }
+}
+
+// Like resolveRequested, but resolves symlinked parent directories so the
+// sensitive-name filter sees the real location. The leaf itself is not followed.
+function resolveMutationSource(start: string, raw: string, showSensitive: boolean): { absolute: string } | null {
+  const target = resolveRequested(start, raw, showSensitive);
+  if (!target) return null;
+  try {
+    const absolute = join(realpathSync(dirname(target.absolute)), basename(target.absolute));
+    const checkPath = inside(start, absolute) ? relative(start, absolute) : absolute;
+    if (!showSensitive && checkPath.split("/").filter(Boolean).some((part) => blockedNames.test(part))) return null;
+    return { absolute };
   } catch { return null; }
 }
 
@@ -572,8 +586,14 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       if (!canWrite(target.absolute)) return { ok: false, message: "当前运行用户没有这个文件的写入权限。" };
       const parentDirectory = assertSafeParent(target.absolute);
       if (!canWrite(parentDirectory)) return { ok: false, message: "为保护原文件，保存需要其所在目录可写；当前目录只读，未作任何更改。" };
+      if (stats.nlink > 1) {
+        // Replacing via rename would split the hard link; write in place instead.
+        writeFileSync(target.absolute, args.content, "utf8");
+        return { ok: true, message: "文件有多个硬链接，已原地保存以保留链接。" };
+      }
       temporaryPath = join(parentDirectory, `.${basename(target.absolute)}.muse-${crypto.randomUUID()}.tmp`);
       writeFileSync(temporaryPath, args.content, { encoding: "utf8", mode: stats.mode, flag: "wx" });
+      if (process.getuid?.() === 0) chownSync(temporaryPath, stats.uid, stats.gid);
       renameSync(temporaryPath, target.absolute);
       temporaryPath = "";
       return { ok: true, message: "文件已原子保存，原内容已安全替换。" };
@@ -606,7 +626,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
   async deleteHostEntry(args) {
     const selectedRoot = findRoot(args.root);
     if (!selectedRoot || !args.path) return { ok: false, message: "不能删除这个位置。" };
-    const source = resolveRequested(selectedRoot.path, args.path, args.showSensitive);
+    const source = resolveMutationSource(selectedRoot.path, args.path, args.showSensitive);
     if (!source || !existsSync(source.absolute)) return { ok: false, message: "项目不存在或路径无效。" };
     const parent = dirname(source.absolute);
     const quarantine = join(parent, `.${basename(source.absolute)}.muse-delete-${crypto.randomUUID()}`);
@@ -633,7 +653,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const targetDirectory = getDirectory(args.root, args.targetDirectory, args.showSensitive);
     const name = validLeaf(args.newName, args.showSensitive);
     if (!selectedRoot || !targetDirectory || !name || !args.path) return { ok: false, message: "源路径、目标目录或名称无效。", path: null };
-    const source = resolveRequested(selectedRoot.path, args.path, args.showSensitive);
+    const source = resolveMutationSource(selectedRoot.path, args.path, args.showSensitive);
     if (!source || !existsSync(source.absolute)) return { ok: false, message: "源项目不存在。", path: null };
     const destination = join(targetDirectory.absolute, name);
     if (existsSync(destination)) return { ok: false, message: "目标位置已有同名项目。", path: null };
@@ -699,29 +719,52 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const started = Date.now();
     const marker = `__MUSE_CWD_${crypto.randomUUID()}__`;
     const wrappedCommand = `export TERM="\${TERM:-xterm-256color}"\ntrap 'printf "\\n${marker}%s\\n" "$PWD"' EXIT\n${args.command}`;
+    if (args.runAsRoot) console.warn(`[muse-audit] root shell uid=${process.getuid?.() ?? "?"} cwd=${cwd} command=${JSON.stringify(args.command.slice(0, 2000))}`);
+    const mode = selectShellExecutionMode(args.runAsRoot, typeof process.getuid === "function" ? process.getuid() : undefined);
+    const [file, spawnArgs] = shellSpawnArgs(mode, wrappedCommand);
     return new Promise((resolvePromise) => {
-      const onComplete = (error: Error | null, stdout: string | Buffer, stderr: string | Buffer) => {
-        const candidate = error as (Error & { code?: number | string; killed?: boolean; signal?: string }) | null;
-        const timedOut = Boolean(candidate?.killed && candidate.signal === "SIGTERM");
-        const code = typeof candidate?.code === "number" ? candidate.code : error ? null : 0;
-        const output = String(stdout);
-        const markerIndex = output.lastIndexOf(`\n${marker}`);
-        let nextCwd = cwd;
-        let cleanStdout = output;
-        if (markerIndex >= 0) {
-          const markerEnd = output.indexOf("\n", markerIndex + 1);
-          const capturedCwd = output.slice(markerIndex + 1 + marker.length, markerEnd >= 0 ? markerEnd : output.length).trim();
-          if (capturedCwd) nextCwd = capturedCwd;
-          cleanStdout = output.slice(0, markerIndex) + output.slice(markerEnd >= 0 ? markerEnd + 1 : output.length);
-        }
-        resolvePromise({ ok: !error, stdout: cleanStdout, stderr: timedOut ? `${String(stderr)}${stderr ? "\n" : ""}命令超过 30 秒，已终止。` : String(stderr), exitCode: code, timedOut, cwd: nextCwd, durationMs: Math.max(0, Date.now() - started) });
+      const output = { stdout: "", stderr: "" };
+      let timedOut = false;
+      let settled = false;
+      // detached puts the shell in its own process group so a timeout kills
+      // background children too, not just bash.
+      const child = spawn(file, spawnArgs, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, TERM: "xterm-256color" } });
+      const collect = (key: "stdout" | "stderr") => (chunk: Buffer) => { if (output[key].length < 1_000_000) output[key] += chunk.toString("utf8"); };
+      child.stdout.on("data", collect("stdout"));
+      child.stderr.on("data", collect("stderr"));
+      const killGroup = () => {
+        try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
       };
-      const options = { cwd, timeout: 30000, maxBuffer: 1_000_000, env: { ...process.env, TERM: "xterm-256color" } };
-      if (args.runAsRoot) console.warn(`[muse-audit] root shell uid=${process.getuid?.() ?? "?"} cwd=${cwd} command=${JSON.stringify(args.command.slice(0, 2000))}`);
-      const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-      const mode = selectShellExecutionMode(args.runAsRoot, uid);
-      if (mode === "sudo") execFile("sudo", ["-n", "/bin/bash", "-c", wrappedCommand], options, onComplete);
-      else exec(wrappedCommand, { ...options, shell: "/bin/bash" }, onComplete);
+      const finish = (code: number | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.stdout.destroy();
+        child.stderr.destroy();
+        const durationMs = Math.max(0, Date.now() - started);
+        if (mode === "sudo" && code === 137 && durationMs >= SHELL_TIMEOUT_MS - 500) timedOut = true;
+        const markerIndex = output.stdout.lastIndexOf(`\n${marker}`);
+        let nextCwd = cwd;
+        let cleanStdout = output.stdout;
+        if (markerIndex >= 0) {
+          const markerEnd = output.stdout.indexOf("\n", markerIndex + 1);
+          const capturedCwd = output.stdout.slice(markerIndex + 1 + marker.length, markerEnd >= 0 ? markerEnd : output.stdout.length).trim();
+          if (capturedCwd) nextCwd = capturedCwd;
+          cleanStdout = output.stdout.slice(0, markerIndex) + output.stdout.slice(markerEnd >= 0 ? markerEnd + 1 : output.stdout.length);
+        }
+        const stderr = timedOut ? `${output.stderr}${output.stderr ? "\n" : ""}命令超过 ${SHELL_TIMEOUT_MS / 1000} 秒，已终止。` : output.stderr;
+        resolvePromise({ ok: code === 0 && !timedOut, stdout: cleanStdout, stderr, exitCode: timedOut ? null : code, timedOut, cwd: nextCwd, durationMs });
+      };
+      const timer = setTimeout(() => {
+        timedOut = true;
+        killGroup();
+        // Under sudo the root shell may outlive the kill; answer anyway.
+        setTimeout(() => finish(null), 500);
+      }, SHELL_TIMEOUT_MS);
+      child.on("error", (error) => { output.stderr += error.message; finish(null); });
+      child.on("close", (code) => finish(code));
+      // A background job that keeps stdout open must not hold the answer until the timeout.
+      child.on("exit", (code) => { setTimeout(() => finish(code), 250); });
     });
   },
 
@@ -731,34 +774,33 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const atMs = Date.now();
     const current: RateSample = { atMs, cpu: cpuSample(), network: networkSample(), disks: diskSample(), processes: processSamples() };
     const elapsedSec = Math.max(0.05, (current.atMs - previous.atMs) / 1000);
-    const cpuPercent = percentFromTicks(current.cpu.total, previous?.cpu.total);
-    const cpuCores = [...current.cpu.cores.entries()].map(([name, ticks]) => ({ name, percent: percentFromTicks(ticks, previous?.cpu.cores.get(name)) }));
-    const totalDelta = previous ? Math.max(0, current.cpu.total.total - previous.cpu.total.total) : 0;
+    const cpuPercent = percentFromTicks(current.cpu.total, previous.cpu.total);
+    const cpuCores = [...current.cpu.cores.entries()].map(([name, ticks]) => ({ name, percent: percentFromTicks(ticks, previous.cpu.cores.get(name)) }));
+    const totalDelta = Math.max(0, current.cpu.total.total - previous.cpu.total.total);
     const coreCount = Math.max(1, cpus().length);
     const allProcesses = [...current.processes.values()].map((processNow) => {
-      const processBefore = previous?.processes.get(processNow.pid);
+      const processBefore = previous.processes.get(processNow.pid);
       const tickDelta = Math.max(0, processNow.ticks - (processBefore?.ticks ?? processNow.ticks));
       return { pid: processNow.pid, name: processNow.name, cpuPercent: totalDelta > 0 ? clampPercent((tickDelta / totalDelta) * coreCount * 100) : 0, memoryBytes: processNow.rss, status: processNow.status };
     });
     const processesByCpu = [...allProcesses].sort((a, b) => b.cpuPercent - a.cpuPercent || b.memoryBytes - a.memoryBytes).slice(0, 18);
     const processesByMemory = [...allProcesses].sort((a, b) => b.memoryBytes - a.memoryBytes || b.cpuPercent - a.cpuPercent).slice(0, 18);
     const interfaces = [...current.network.entries()].map(([name, counters]) => {
-      const before = previous?.network.get(name);
+      const before = previous.network.get(name);
       return { name, rxPerSec: elapsedSec > 0 ? Math.max(0, (counters.rx - (before?.rx ?? counters.rx)) / elapsedSec) : 0, txPerSec: elapsedSec > 0 ? Math.max(0, (counters.tx - (before?.tx ?? counters.tx)) / elapsedSec) : 0 };
     }).sort((a, b) => a.name.localeCompare(b.name));
     const network = interfaces.filter((item) => item.name !== "lo").reduce((sum, item) => ({ rxPerSec: sum.rxPerSec + item.rxPerSec, txPerSec: sum.txPerSec + item.txPerSec }), { rxPerSec: 0, txPerSec: 0 });
     const disks = [...current.disks.entries()].map(([name, counters]) => {
-      const before = previous?.disks.get(name);
+      const before = previous.disks.get(name);
       return { name, readPerSec: elapsedSec > 0 ? Math.max(0, (counters.readBytes - (before?.readBytes ?? counters.readBytes)) / elapsedSec) : 0, writePerSec: elapsedSec > 0 ? Math.max(0, (counters.writeBytes - (before?.writeBytes ?? counters.writeBytes)) / elapsedSec) : 0 };
     }).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
     const sampledAt = new Date(atMs);
     const uptimeSec = uptime();
-    const serviceUptimeSec = process.uptime();
     let kernelVersion = `${platform()} ${release()}`;
     try { kernelVersion = readFileSync("/proc/version", "utf8").trim(); } catch { /* use compact fallback */ }
     return {
       sampledAt: sampledAt.toISOString(), platform: `${platform()} ${release()}`, hostname: hostname(), kernelVersion,
-      uptimeSec, serviceUptimeSec, bootedAt: new Date(systemBootedAtMs(atMs, uptimeSec)).toISOString(), serviceStartedAt: new Date(atMs - serviceUptimeSec * 1000).toISOString(),
+      uptimeSec, bootedAt: new Date(systemBootedAtMs(atMs, uptimeSec)).toISOString(),
       cpuPercent, cpuCores, loadAverage: loadavg(), memory: memorySample(), mounts: [mountSample("/"), mountSample("/home/hatch"), mountSample("/tmp")], disks,
       network: { ...network, interfaces }, processCount: current.processes.size, processesByCpu, processesByMemory,
     };

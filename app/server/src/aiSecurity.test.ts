@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AiEmptyOutputError, AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, extractAiMessageCommand, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { AiEmptyOutputError, AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, extractAiMessageCommand, isPrivateAddress, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
 
 describe("SSRF guard", () => {
   test("accepts public OpenAI-compatible hosts", () => {
@@ -32,6 +32,17 @@ describe("SSRF guard", () => {
   test("isPrivateHostname covers .internal", () => {
     expect(isPrivateHostname("foo.internal")).toBe(true);
     expect(isPrivateHostname("api.openai.com")).toBe(false);
+  });
+
+  test("rejects trailing-dot hosts and reserved ranges", () => {
+    expect(requirePublicBaseUrl.bind(null, "http://localhost./v1")).toThrow();
+    for (const address of ["198.18.0.1", "198.19.255.255", "240.0.0.1", "255.255.255.255", "224.0.0.1"]) expect(isPrivateHostname(address)).toBe(true);
+    expect(isPrivateHostname("198.20.0.1")).toBe(false);
+  });
+
+  test("classifies resolved addresses", () => {
+    for (const address of ["127.0.0.1", "10.0.0.1", "::1", "::", "fe80::1", "fd00::1", "::ffff:127.0.0.1"]) expect(isPrivateAddress(address)).toBe(true);
+    for (const address of ["8.8.8.8", "2606:4700::1111", "::ffff:8.8.8.8"]) expect(isPrivateAddress(address)).toBe(false);
   });
 });
 

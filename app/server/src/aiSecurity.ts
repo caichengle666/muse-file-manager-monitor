@@ -6,6 +6,7 @@
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
+import { lookup } from "node:dns/promises";
 
 export const AI_REQUEST_TIMEOUT_MS = 60_000;
 // Agent steps run inside one platform action call. Keep each call below the
@@ -25,7 +26,6 @@ export type AiDiagnostic = {
   responseSnippet: string;
   contentSnippet: string;
 };
-
 
 export class AiRequestError extends Error {
   readonly diagnostic: AiDiagnostic;
@@ -66,16 +66,33 @@ export function constantTimeEqual(left: string, right: string): boolean {
   return timingSafeEqual(leftBytes, rightBytes);
 }
 
-const PRIVATE_IPV4_PATTERN = /^(?:0|10|127|169\.254|192\.168|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])|172\.(?:1[6-9]|2\d|3[01]))\./;
+const PRIVATE_IPV4_PATTERN = /^(?:0|10|127|169\.254|192\.168|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])|172\.(?:1[6-9]|2\d|3[01])|198\.1[89]|22[4-9]|2[3-5]\d)\./;
+
+// Literal address check. IPv6 literals are refused outright except public
+// unicast; IPv4-mapped IPv6 falls back to the IPv4 rules.
+export function isPrivateAddress(address: string): boolean {
+  const normalized = address.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(normalized);
+  if (mapped) return isPrivateAddress(mapped[1] ?? "");
+  if (normalized.includes(":")) return normalized === "::" || normalized === "::1" || /^(?:f[c-f]|::ffff:|64:ff9b:|2001:db8)/.test(normalized);
+  return PRIVATE_IPV4_PATTERN.test(normalized);
+}
 
 export function isPrivateHostname(hostname: string): boolean {
-  const normalized = hostname.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  const normalized = hostname.trim().replace(/^\[|\]$/g, "").replace(/\.+$/, "").toLowerCase();
   if (!normalized) return true;
   if (normalized === "localhost" || normalized.endsWith(".localhost")) return true;
   if (normalized.endsWith(".local") || normalized.endsWith(".internal")) return true;
   if (normalized.includes(":")) return true;
-  if (PRIVATE_IPV4_PATTERN.test(normalized)) return true;
-  return false;
+  return isPrivateAddress(normalized);
+}
+
+// Resolves the host and refuses it when any address is private. Best-effort:
+// fetch resolves again, so DNS rebinding between the two lookups is not covered.
+export async function assertPublicResolution(url: string): Promise<void> {
+  const { hostname } = new URL(url);
+  const addresses = await lookup(hostname.replace(/\.+$/, ""), { all: true }).catch(() => []);
+  if (addresses.some((entry) => isPrivateAddress(entry.address))) throw new Error("模型地址解析到本机或内网 IP，已拒绝。");
 }
 
 export function normalizeAiBaseUrl(value: string): string | null {
@@ -178,10 +195,6 @@ export function extractAiToolCalls(value: unknown): AiToolCall[] {
   return value.map(readAiToolCall).filter((call): call is AiToolCall => call !== null);
 }
 
-export function extractAiFunctionCall(value: unknown): AiToolCall | null {
-  return readAiToolCall(value);
-}
-
 export type AiMessageCommand = { text: string; source: "content" | "tool_call" | "function_call"; toolName: string };
 
 // Some OpenAI-compatible models answer with tool_calls or function_call instead of
@@ -193,7 +206,7 @@ export function extractAiMessageCommand(message: unknown): AiMessageCommand | nu
   if (content.trim()) return { text: content, source: "content", toolName: "" };
   const firstToolCall = extractAiToolCalls(record.tool_calls)[0];
   if (firstToolCall) return { text: firstToolCall.arguments, source: "tool_call", toolName: firstToolCall.name };
-  const functionCall = extractAiFunctionCall(record.function_call);
+  const functionCall = readAiToolCall(record.function_call);
   if (functionCall) return { text: functionCall.arguments, source: "function_call", toolName: functionCall.name };
   return null;
 }

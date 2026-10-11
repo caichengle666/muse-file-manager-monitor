@@ -1,6 +1,41 @@
 # Changelog
 
-## v0.1 — 2026-10-03（首次公开发布）
+## v0.2.0 — 2026-10-11（安全审查修复）
+
+**命令确认（仍是黑名单模型：只有写入/删除文件和数据的命令需要确认）**
+- 修复确认绕过：单引号里的反斜杠按 bash 规则当普通字符，`echo 'a\' ; rm -rf /tmp/victim #'` 这类命令不再被当成只读自动执行
+- 重写 `commandPolicy.ts`：一个按 bash 规则的词法分析器（引号、转义、heredoc、here-string、命令替换、进程替换），递归检查 `$(...)`、反引号、`bash -c`、`eval`、`find -exec`、`env -S`、`su -c`、`trap` 里的命令
+- 包装命令按各自带参数的选项解析（`sudo -u X`、`timeout -s KILL 5`、`env -u X`、`xargs -n 1`、`nice -n`、`ionice -c`、`stdbuf`、`time -o` 等），不再把选项值当成命令名
+- 新增识别：`perl -i/-pi`、`ruby -i`、`sed -i`/`--in-place=`/`w` 命令、awk 的 `print >`/`>>`/管道/`system()` 和 `-i inplace`、不带横线的 `tar x`（以及写归档的 `c/r/u/A`、`--delete`）、`git rm/mv/stash/checkout/restore/switch/pull/clean/reset --hard/clone` 等、`sort -o`、`uniq 输入 输出`、`wget` 默认下载落盘、`curl -o/--output=/-O`、`dd of=`、`chmod`/`chown`、压缩解压、`crontab`、数据库写语句、`python -c`/`node -e`/`perl -e`/`ruby -e`/`php -r` 内联代码里的写删调用
+- 命令名本身动态（`$VAR`、`$(...)`、反引号、`$'..'`、通配符）、`eval` 动态内容、shell 或解释器执行管道传来的未知代码（如 `curl … | sh`）时需要确认；`$VAR`/`$(...)` 只作为只读命令参数时照常自动执行
+- `2>/dev/null`、`>/dev/null 2>&1`、`&>/dev/null` 和 `2>&1` 不再触发确认
+- 删除只为测试服务的 `category` 分类及 git/docker/kubectl/包管理器等标签表，只保留"确认还是执行"和给用户看的原因
+
+**AI Agent**
+- 新增「拒绝」按钮；等待确认时输入新消息会撤销待执行命令并把意见交给模型；任务进行中输入的补充要求会进入模型上下文；不再因为发了消息而卡在无法确认的状态
+- 页面刷新后服务端会为同一条待确认命令重新发放一次性令牌
+- 上下文裁剪保留系统提示和任务描述，不再先删掉任务本身
+- 只重试网络错误/超时、HTTP 429/5xx 和模型空输出；401/403/404 等直接报错，只有空输出才追加纠正提示
+- 模型返回 `done=true` 但带了命令时先执行命令；单次点击到 40 轮上限时提示点「继续」
+- 按任务 id 加并发锁（第一次 await 之前），服务重启后并发恢复不会重复执行同一条命令
+- 删除无效的模型配置/owner 校验（配置 id 恒为 1）
+
+**命令执行**
+- 单条命令超时改为 25 秒（低于 30 秒的特权合约超时），超时用 SIGKILL 杀掉整个进程组；sudo 模式下由 root 侧的 `timeout -s KILL` 执行；stdin 关闭；后台进程占着输出也不会拖到超时
+
+**安全与数据**
+- API Key 不再返回给页面：配置接口只给是否已保存和打码提示，输入框改为密码框，留空保存沿用已存的 Key
+- 模型地址校验：拒绝末尾带点的 localhost、198.18/15、组播和 240/4 保留段，请求前解析 DNS 并拒绝解析到内网的地址；拉取模型列表先检查 HTTP 状态
+- 文本保存以 root 运行时保留原属主/属组，多硬链接文件原地写入；删除/移动先解析父目录真实路径再做敏感名过滤
+- `drizzle/meta/_journal.json` 登记全部 4 个 migration；运行时建表合并为一个每进程执行一次的 `ensureTables`
+- 确认令牌不再明文写入数据库；`ai_agent_context.confirm_token` 列保留但不再使用
+- 删除无调用方的 `getFileAccess`、`generateAiShellCommand`、快照里被覆盖的服务运行时长字段和 `extractAiFunctionCall` 包装函数；旧私有数据迁移每个会话只调用一次
+
+**文档**
+- README、SKILL.md、architecture.md 去掉版本号；版本只写在 `app/package.json`（`version` 字段）和 git tag
+- 修正 migration 数量、`workspace_items` 用途、API Key 说明、确认令牌有效期、超时与步数上限；architecture.md 第 3 节按实际合约重写，章节顺序和重复内容整理
+
+## v0.1.0 — 2026-10-03（首次公开发布）
 
 文件管理器 + 系统监控 + 网页终端（React 19 前端 + Bun 后端，Muse skill）。
 
@@ -14,12 +49,12 @@
 - 每个挂载点独立容量（`/`、`/home/hatch`、`/tmp`）、磁盘 I/O 速率、每核 CPU 曲线、1/5/15 分钟负载、内存细分（已用/缓存/缓冲）、按网卡拆分的上下行速率、Top 进程（按 CPU/内存排序）、主机信息（内核/主机名/启动时间）
 - `/home/hatch` 一级目录占用排行（手动扫描按钮，不进轮询）；服务重启记录（累计次数、上次重启时间、本次启动时间，持久化）
 
-**终端页签与 AI Agent**：网页里执行 shell 命令（单次 30 秒超时）；可配置外部 OpenAI-compatible API、拉取模型，并让 AI 按“生成命令 → 执行 → 读取 stdout/stderr → 继续下一步”的循环完成最多 20 步任务。只有写入、修改、移动或删除文件的命令暂停等待用户确认，安装、Git、网络、服务、权限、容器和未知命令自动执行。RCE 级能力，只用于完全控制的私有部署。
+**终端页签与 AI Agent**：网页里执行 shell 命令（单次 30 秒超时）；可配置外部 OpenAI-compatible API、拉取模型，并让 AI 按“生成命令 → 执行 → 读取 stdout/stderr → 继续下一步”的循环完成多步任务（每次点击最多 40 轮，约 20 步）。只有写入、修改、移动或删除文件的命令暂停等待用户确认，安装、Git、网络、服务、权限、容器和未知命令自动执行。RCE 级能力，只用于完全控制的私有部署。
 
 **关键设计决定**
 - 命令确认规则收窄到文件变更（`server/src/commandPolicy.ts`）：重定向、删除/复制/移动、原地编辑、解包和脚本中的文件写入需要确认；安装、Git、服务、网络、权限、容器和未知命令不再被无关拦截
-- 修改/删除确认由服务端一次性 `confirmToken` 把关（SHA-256 存储、5 分钟过期、命令内容必须匹配、用后即焚），不再信任客户端布尔标志
-- AI Agent 任务有 30 分钟 TTL、单任务并发锁、100 个任务上限和消息总量上限；模型请求有 60 秒超时，模型地址拒绝私网/本机/重定向（SSRF 防护），模型输出解析容忍代码块和前后解释文字
+- 修改/删除确认由服务端一次性 `confirmToken` 把关（SHA-256 存储、只对当前待执行命令有效、用后即焚，随任务 30 分钟 TTL 失效），不再信任客户端布尔标志
+- AI Agent 任务有 30 分钟 TTL、单任务并发锁、100 个任务上限和消息总量上限；Agent 单步模型请求 100 秒超时、拉取模型列表 60 秒超时，模型地址拒绝私网/本机/重定向（SSRF 防护），模型输出解析容忍代码块和前后解释文字
 - 修复 AI Agent 在 worker 已以 root 运行时命令不执行的问题：原先 root 分支写成两个独立 `if`，导致 `runAsRoot=true` 且 `getuid()==0` 时既不进 sudo 也不进普通 shell，Promise 永不返回，最终报 `parse privileged executor response`；现在用 `selectShellExecutionMode` 显式三态分流并加了回归单测
 - AI Agent 执行的命令和输出会同步到网页终端输出区（标记为 `AI $`），不再只显示在 Agent 小面板里
 - AI 终端面板改为「折叠配置 + 对话区」：模型配置默认收起（未配置时自动展开），任务以对话形式展示，每条回复内联显示该步命令、stdout/stderr、退出码和 cwd，底部输入框可持续追加要求
@@ -33,5 +68,5 @@
 - AI Agent 单步模型请求超时从 20 秒放宽到 100 秒，避免慢模型被过早中止；若平台网关再次出现超时，可适当回调这个值
 - 文件写/删/移在操作前拒绝符号链接叶子并重新解析父目录真实路径，降低 TOCTOU/符号链接风险；终端面板改为固定高度，输出区可靠内滚
 - 私有存储从 SQLite 虚拟文件系统改为真实目录映射；旧虚拟 FS 的 10 个 action 及独占代码已彻底移除，仅保留一次性的 `migratePrivateWorkspace`
-- drizzle migration 包含 `service_restart_record.sql`、`workspace_items.sql` 和 `ai_provider_config.sql`，全部 `IF NOT EXISTS` 幂等
+- drizzle migration 包含 `service_restart_record.sql`、`workspace_items.sql`、`ai_provider_config.sql` 和 `ai_agent_context.sql`，全部 `IF NOT EXISTS` 幂等
 - 系统启动时间读 `/proc/stat` 的 btime 并进程内缓存，不随采样漂移

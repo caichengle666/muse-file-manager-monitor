@@ -15,6 +15,20 @@
       "when": 1790824882188,
       "tag": "workspace_items",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791100000000,
+      "tag": "ai_provider_config",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1791100000001,
+      "tag": "ai_agent_context",
+      "breakpoints": true
     }
   ]
 }

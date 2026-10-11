@@ -1,375 +1,656 @@
 /**
- * Shell command classification for the AI Agent.
+ * Decides whether an AI Agent shell command needs the user's confirmation.
  *
- * The previous implementation matched a single regular expression against the
- * whole command. That let `sudo rm -rf`, `bash -c 'rm -rf ...'`, `find -delete`
- * and `echo x > file` slip through as "read only" and run without confirmation.
+ * Blacklist model (owner decision): only commands that write, modify, move or
+ * delete files or data pause for confirmation. Reads, network reads, process
+ * listing and unknown commands run automatically. When the command that would
+ * actually run cannot be known statically (a dynamic command name, `eval` of
+ * dynamic text, a shell or interpreter reading code from an unknown pipe) it is
+ * treated as a possible delete and needs confirmation.
  *
- * Only commands that can write, modify, move, or delete files require
- * confirmation. Other commands are intentionally allowed for this private
- * artifact, including installs, service operations, network requests, and
- * otherwise unknown commands.
+ * This is best-effort static analysis of bash, not a sandbox.
  */
 
-export type CommandCategory = "read" | "test" | "mutating" | "unknown";
+export type CommandAssessment = { requiresConfirmation: boolean; reason: string };
 
-export type CommandAssessment = {
-  requiresConfirmation: boolean;
-  category: CommandCategory;
-  reason: string;
-};
+// Marks text produced by an expansion ($VAR, $(...), `...`, $'...') that is only
+// known at run time.
+const DYN = "\u0001";
+const MAX_DEPTH = 8;
 
-const WRAPPERS = new Set([
-  "sudo", "doas", "command", "builtin", "exec", "nohup", "nice", "ionice",
-  "time", "timeout", "env", "stdbuf", "setsid", "xargs", "watch", "chronic",
+type Word = { text: string; glob: boolean; quoted: boolean };
+type Redirect = { op: string; target: Word };
+type Segment = { words: Word[]; redirects: Redirect[]; stdin: string[]; pipedFrom: Segment | null };
+type Stdin = { texts: string[]; unknown: boolean };
+
+const SAFE_TARGET = /^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/;
+const WRITE_REDIRECTS = new Set([">", ">>", ">|", "&>", "&>>", "<>"]);
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/;
+const RESERVED_SKIP = new Set(["!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "esac", "]]"]);
+const BLOCK_START = new Set(["for", "case", "select", "function", "[[", "[", "test"]);
+const SHELLS = new Set(["sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "fish", "csh", "tcsh"]);
+const ALWAYS_WRITE = new Set([
+  "rm", "rmdir", "unlink", "shred", "wipe", "truncate", "mv", "cp", "install", "rsync", "scp", "touch",
+  "mkdir", "mknod", "mkfifo", "ln", "link", "rename", "chmod", "chown", "chgrp", "chattr", "setfacl",
+  "mkswap", "wipefs", "fdisk", "sfdisk", "parted", "split", "csplit", "zip", "sudoedit",
 ]);
+const COMPRESSORS = new Set(["gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "lzma", "unlzma", "zstd", "unzstd", "pigz", "unpigz", "lz4", "compress", "uncompress", "brotli"]);
+const SQL_CLIENTS = new Set(["sqlite3", "mysql", "mariadb", "psql"]);
+const GIT_WRITE = new Set(["rm", "mv", "clean", "restore", "checkout", "switch", "pull", "merge", "rebase", "cherry-pick", "revert", "am", "clone", "init"]);
+const INLINE_WRITE = new RegExp([
+  String.raw`\bf?open\s*\([^)]*,\s*(?:mode\s*=\s*)?["'][^"']*[wax+]`,
+  String.raw`\bopen\s*\(?\s*(?:my\s+)?[$\w]*\s*,\s*["']\s*(?:>|\+<|\|)`,
+  String.raw`\b(?:unlink|rmdir|rename|mkdir|makedirs|removedirs|truncate|chmod|chown|symlink|rmtree|writeFile|appendFile|copyFile|createWriteStream|file_put_contents|write_text|write_bytes|touch)(?:Sync)?\s*[(\s]`,
+  String.raw`\.(?:rm|cp|move|copy\w*)(?:Sync)?\s*\(|\bos\.remove\b`,
+  String.raw`\bBun\.write\b|\bDeno\.(?:write\w*|remove|rename|mkdir|truncate|chmod|chown|symlink|link|copyFile|create)\b`,
+  String.raw`\b(?:File|IO)\.(?:write|delete|unlink|rename|symlink|link|chmod|chown|truncate)\b|\bFileUtils\.\w+|\bDir\.(?:mkdir|rmdir|delete|unlink)\b`,
+].join("|"));
+const INLINE_SPAWN = /\b(?:system|popen|Popen|exec\w*|spawn\w*|subprocess|child_process|shell_exec|passthru|proc_open)\b|`|%x|\bqx\b/;
 
-const SHELL_INTERPRETERS = new Set([
-  "sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "csh", "tcsh", "busybox",
-]);
+const isDynamic = (text: string): boolean => text.includes(DYN);
+const isSafeTarget = (text: string): boolean => !isDynamic(text) && SAFE_TARGET.test(text);
+const show = (text: string): string => text.replaceAll(DYN, "$…");
 
-const INLINE_CODE_FLAGS = new Map<string, Set<string>>([
-  ["node", new Set(["-e", "--eval", "-p", "--print"])],
-  ["nodejs", new Set(["-e", "--eval", "-p", "--print"])],
-  ["python", new Set(["-c"])],
-  ["python3", new Set(["-c"])],
-  ["perl", new Set(["-e", "-E"])],
-  ["ruby", new Set(["-e"])],
-  ["php", new Set(["-r"])],
-  ["lua", new Set(["-e"])],
-  ["deno", new Set(["eval"])],
-]);
+class Lexer {
+  private i = 0;
+  readonly nested: string[] = [];
+  readonly segments: Segment[] = [];
+  private cur: Segment = { words: [], redirects: [], stdin: [], pipedFrom: null };
+  private heredocs: Array<{ delim: string; strip: boolean; expand: boolean; seg: Segment }> = [];
 
-const READ_ONLY = new Set([
-  "ls", "dir", "vdir", "pwd", "cat", "tac", "head", "tail", "less", "more", "most",
-  "wc", "nl", "od", "hexdump", "xxd", "strings", "grep", "egrep", "fgrep", "rg",
-  "ripgrep", "ag", "ack", "find", "fd", "fdfind", "locate", "which", "type",
-  "whereis", "whatis", "stat", "file", "du", "df", "tree", "realpath", "readlink",
-  "basename", "dirname", "echo", "printf", "date", "cal", "uptime", "whoami", "id",
-  "groups", "hostname", "uname", "arch", "nproc", "getconf", "env", "printenv",
-  "ps", "pstree", "top", "htop", "free", "vmstat", "iostat", "mpstat", "pidstat",
-  "sar", "lscpu", "lsblk", "lspci", "lsusb", "lsmod", "modinfo", "dmesg",
-  "journalctl", "ss", "netstat", "ifconfig", "route", "arp", "dig", "nslookup",
-  "host", "ping", "ping6", "traceroute", "tracepath", "mtr", "clear", "reset",
-  "tput", "seq", "expr", "test", "[", "true", "false", ":", "sleep", "cd", "pushd",
-  "popd", "dirs", "export", "unset", "set", "alias", "unalias", "history", "umask",
-  "sha256sum", "sha1sum", "md5sum", "cksum", "cmp", "diff", "comm", "sort", "uniq",
-  "cut", "paste", "tr", "jq", "yq", "base64", "zipinfo",
-  "getent", "last", "lastlog", "w", "who", "users", "locale",
-]);
+  constructor(private readonly s: string) {}
 
-const MUTATING = new Set([
-  "rm", "rmdir", "unlink", "shred", "truncate", "dd", "mv", "cp", "install", "rsync",
-  "scp", "sftp", "tee", "touch", "mkdir", "mknod", "ln", "link", "rename", "chmod",
-  "chown", "chgrp", "chattr", "setfacl", "setcap", "zip", "unzip", "gzip", "gunzip",
-  "bzip2", "bunzip2", "xz", "unxz", "7z", "cpio", "patch", "make", "cmake", "meson",
-  "ninja", "gradle", "mvn", "kill", "pkill", "killall", "reboot", "shutdown",
-  "poweroff", "halt", "init", "telinit", "mount", "umount", "swapon", "swapoff",
-  "iptables", "ip6tables", "nft", "ufw", "firewall-cmd", "useradd", "userdel",
-  "usermod", "groupadd", "groupdel", "passwd", "chpasswd", "crontab", "at", "batch",
-  "systemd-run", "apt", "apt-get", "aptitude", "yum", "dnf", "apk", "pacman",
-  "zypper", "brew", "snap", "pip", "pip3", "conda", "npm", "pnpm", "yarn", "bun",
-  "go", "cargo", "rustup", "docker", "podman", "kubectl", "helm", "terraform",
-  "ansible", "ansible-playbook", "aws", "gcloud", "az", "mysql", "psql", "sqlite3",
-  "openssl", "telnet",
-  "redis-cli", "mongosh", "nc", "ncat", "netcat", "ssh", "script", "source",
-  "git", "sed", "perl", "awk", "gawk", "python", "python3", "node", "ruby", "php",
-  "deno", "bash", "sh", "zsh", "dash", "ksh", "fish",
-]);
-
-const TEST_COMMANDS = new Set([
-  "pytest", "jest", "vitest", "rspec", "phpunit", "bats", "ctest", "tox", "nox",
-  "nose2", "gtest", "unittest", "playwright", "cypress",
-]);
-
-const COMMAND_SUBSTITUTION = /\$\(|`|<\(|>\(/;
-
-function splitShellSegments(command: string): string[] {
-  const segments: string[] = [];
-  let current = "";
-  let quote: "'" | '"' | null = null;
-  let escaped = false;
-  for (let index = 0; index < command.length; index += 1) {
-    const char = command[index] ?? "";
-    if (escaped) { current += char; escaped = false; continue; }
-    if (char === "\\") { current += char; escaped = true; continue; }
-    if (quote) {
-      if (char === quote) quote = null;
-      current += char;
-      continue;
-    }
-    if (char === "'" || char === '"') { quote = char; current += char; continue; }
-    const isDescriptorCopy = char === "&" && (command[index - 1] === ">" || command[index - 1] === "<") && /[0-9-]/.test(command[index + 1] ?? "");
-    const isCombinedRedirect = char === "&" && command[index + 1] === ">";
-    if (char === ";" || char === "\n" || ((char === "&" || char === "|") && !isDescriptorCopy && !isCombinedRedirect)) {
-      if ((char === "&" || char === "|") && command[index + 1] === char) index += 1;
-      segments.push(current);
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-  segments.push(current);
-  return segments.map((segment) => segment.trim()).filter(Boolean);
-}
-
-function tokenizeShellSegment(segment: string): string[] {
-  const tokens: string[] = [];
-  let current = "";
-  let quote: "'" | '"' | null = null;
-  let escaped = false;
-  for (let index = 0; index < segment.length; index += 1) {
-    const char = segment[index] ?? "";
-    if (escaped) { current += char; escaped = false; continue; }
-    if (char === "\\") { escaped = true; continue; }
-    if (quote) {
-      if (char === quote) quote = null;
-      else current += char;
-      continue;
-    }
-    if (char === "'" || char === '"') { quote = char; continue; }
-    if (char === " " || char === "\t" || char === "\r") {
-      if (current) { tokens.push(current); current = ""; }
-      continue;
-    }
-    current += char;
-  }
-  if (current) tokens.push(current);
-  return tokens;
-}
-
-function extractBaseCommand(segment: string): { name: string; args: string[] } {
-  const tokens = tokenizeShellSegment(segment);
-  let index = 0;
-  let guard = 0;
-  while (index < tokens.length && guard < 32) {
-    guard += 1;
-    const token = tokens[index] ?? "";
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) { index += 1; continue; }
-    if (!WRAPPERS.has(token)) break;
-    index += 1;
-    if (token === "timeout") {
-      while (index < tokens.length && (tokens[index] ?? "").startsWith("-")) index += 1;
-      if (index < tokens.length) index += 1;
-    } else if (token === "nice" || token === "ionice" || token === "time" || token === "watch") {
-      while (index < tokens.length && ((tokens[index] ?? "").startsWith("-") || /^\d+$/.test(tokens[index] ?? ""))) index += 1;
-    } else if (token === "env") {
-      while (index < tokens.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "") || (tokens[index] ?? "").startsWith("-"))) index += 1;
-    } else {
-      while (index < tokens.length && (tokens[index] ?? "").startsWith("-")) index += 1;
-    }
-  }
-  const rawName = tokens[index] ?? "";
-  return { name: rawName.split("/").pop() ?? rawName, args: tokens.slice(index + 1) };
-}
-
-function hasOutputRedirection(segment: string): boolean {
-  let quote: "'" | '"' | null = null;
-  let escaped = false;
-  for (let index = 0; index < segment.length; index += 1) {
-    const char = segment[index] ?? "";
-    if (escaped) { escaped = false; continue; }
-    if (char === "\\") { escaped = true; continue; }
-    if (quote) { if (char === quote) quote = null; continue; }
-    if (char === "'" || char === '"') { quote = char; continue; }
-    if (char === ">") {
-      if (/^>>?&(?:\d+|-)/.test(segment.slice(index))) {
-        index += segment.slice(index).match(/^>>?&(?:\d+|-)/)?.[0].length ?? 0;
+  run(): this {
+    const s = this.s;
+    while (this.i < s.length) {
+      const c = s[this.i] ?? "";
+      const next = s[this.i + 1] ?? "";
+      if (c === " " || c === "\t" || c === "\r") { this.i += 1; continue; }
+      if (c === "\\" && next === "\n") { this.i += 2; continue; }
+      if (c === "\n") { this.i += 1; this.readHeredocs(); this.end(false); continue; }
+      if (c === "#") { while (this.i < s.length && s[this.i] !== "\n") this.i += 1; continue; }
+      if (this.inDoubleBracket() && (c === "<" || c === ">")) { this.cur.words.push({ text: c, glob: false, quoted: true }); this.i += 1; continue; }
+      if (c === "(" && next === "(" && !this.cur.words.length) {
+        const end = this.balanced(this.i + 1);
+        this.scanExpansions(s.slice(this.i + 2, end - 1));
+        this.i = s[end] === ")" ? end + 1 : end;
         continue;
       }
-      return true;
+      if (c === ";") { this.i += next === ";" || next === "&" ? 2 : 1; this.end(false); continue; }
+      if (c === "&" && next !== ">") { this.i += next === "&" ? 2 : 1; this.end(false); continue; }
+      if (c === "|") { this.i += next === "|" || next === "&" ? 2 : 1; this.end(next !== "|"); continue; }
+      if (c === "(" || c === ")") { this.i += 1; this.end(false); continue; }
+      if ((c === "<" || c === ">" || c === "&") && next !== "(") { this.readRedirect(); continue; }
+      const word = this.readWord();
+      if (!word.quoted && /^\d+$/.test(word.text) && (s[this.i] === "<" || s[this.i] === ">") && s[this.i + 1] !== "(") { this.readRedirect(); continue; }
+      this.cur.words.push(word);
+    }
+    this.readHeredocs();
+    this.end(false);
+    return this;
+  }
+
+  private inDoubleBracket(): boolean {
+    return this.cur.words[0]?.text === "[[" && !this.cur.words.some((word) => word.text === "]]");
+  }
+
+  private end(pipe: boolean): void {
+    const done = this.cur;
+    if (done.words.length || done.redirects.length) this.segments.push(done);
+    this.cur = { words: [], redirects: [], stdin: [], pipedFrom: pipe ? done : null };
+  }
+
+  private readRedirect(): void {
+    const ops = ["&>>", "&>", ">>", ">|", ">&", "<<<", "<<-", "<<", "<>", "<&", ">", "<"];
+    const op = ops.find((candidate) => this.s.startsWith(candidate, this.i)) ?? this.s[this.i] ?? "";
+    this.i += op.length;
+    while (this.s[this.i] === " " || this.s[this.i] === "\t") this.i += 1;
+    const target = this.readWord();
+    if (op === "<<" || op === "<<-") {
+      this.heredocs.push({ delim: target.text, strip: op === "<<-", expand: !target.quoted, seg: this.cur });
+      return;
+    }
+    if (op === "<<<") this.cur.stdin.push(target.text);
+    this.cur.redirects.push({ op, target });
+  }
+
+  private readHeredocs(): void {
+    for (const heredoc of this.heredocs) {
+      const body: string[] = [];
+      while (this.i < this.s.length) {
+        const lineEnd = this.s.indexOf("\n", this.i);
+        const line = this.s.slice(this.i, lineEnd < 0 ? this.s.length : lineEnd);
+        this.i = lineEnd < 0 ? this.s.length : lineEnd + 1;
+        if ((heredoc.strip ? line.replace(/^\t+/, "") : line) === heredoc.delim) break;
+        body.push(line);
+      }
+      const text = body.join("\n");
+      heredoc.seg.stdin.push(text);
+      if (heredoc.expand) this.scanExpansions(text);
+    }
+    this.heredocs = [];
+  }
+
+  private readWord(): Word {
+    const s = this.s;
+    let text = "";
+    let glob = false;
+    let quoted = false;
+    while (this.i < s.length) {
+      const c = s[this.i] ?? "";
+      if ((c === "<" || c === ">") && s[this.i + 1] === "(") {
+        const end = this.balanced(this.i + 1);
+        this.nested.push(s.slice(this.i + 2, end - 1));
+        text += DYN;
+        this.i = end;
+        continue;
+      }
+      if (" \t\r\n;&|()<>".includes(c)) break;
+      if (c === "\\") { if (s[this.i + 1] !== "\n") text += s[this.i + 1] ?? ""; this.i += 2; quoted = true; continue; }
+      if (c === "'") {
+        const end = s.indexOf("'", this.i + 1);
+        const stop = end < 0 ? s.length : end;
+        text += s.slice(this.i + 1, stop);
+        this.i = stop + 1;
+        quoted = true;
+        continue;
+      }
+      if (c === '"') { this.i += 1; text += this.readDouble('"'); quoted = true; continue; }
+      if (c === "$") { text += this.readDollar(false); continue; }
+      if (c === "`") { text += this.readBacktick(); continue; }
+      if (c === "*" || c === "?" || c === "[") glob = true;
+      text += c;
+      this.i += 1;
+    }
+    return { text, glob, quoted };
+  }
+
+  // Reads double-quoted content up to `terminator` (or to the end when null).
+  private readDouble(terminator: string | null): string {
+    const s = this.s;
+    let out = "";
+    while (this.i < s.length && s[this.i] !== terminator) {
+      const c = s[this.i] ?? "";
+      if (c === "\\") {
+        const n = s[this.i + 1] ?? "";
+        if ('$`"\\\n'.includes(n) && n) { if (n !== "\n") out += n; this.i += 2; } else { out += c; this.i += 1; }
+        continue;
+      }
+      if (c === "$") { out += this.readDollar(true); continue; }
+      if (c === "`") { out += this.readBacktick(); continue; }
+      out += c;
+      this.i += 1;
+    }
+    this.i += 1;
+    return out;
+  }
+
+  private readDollar(inDouble: boolean): string {
+    const s = this.s;
+    const n = s[this.i + 1] ?? "";
+    if (n === "'" && !inDouble) {
+      let j = this.i + 2;
+      while (j < s.length && s[j] !== "'") j += s[j] === "\\" ? 2 : 1;
+      this.i = j + 1;
+      return DYN;
+    }
+    if (n === "(") {
+      const end = this.balanced(this.i + 1);
+      const inner = s.slice(this.i + 2, end - 1);
+      if (s[this.i + 2] === "(") this.scanExpansions(inner);
+      else this.nested.push(inner);
+      this.i = end;
+      return DYN;
+    }
+    if (n === "{") {
+      let j = this.i + 2;
+      let depth = 1;
+      while (j < s.length && depth > 0) { if (s[j] === "{") depth += 1; else if (s[j] === "}") depth -= 1; j += 1; }
+      this.scanExpansions(s.slice(this.i + 2, j - 1));
+      this.i = j;
+      return DYN;
+    }
+    const name = /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/.exec(s.slice(this.i + 1));
+    if (name) { this.i += 1 + name[0].length; return DYN; }
+    this.i += 1;
+    return "$";
+  }
+
+  private readBacktick(): string {
+    const s = this.s;
+    let j = this.i + 1;
+    while (j < s.length && s[j] !== "`") j += s[j] === "\\" ? 2 : 1;
+    this.nested.push(s.slice(this.i + 1, j).replace(/\\([`$\\])/g, "$1"));
+    this.i = j + 1;
+    return DYN;
+  }
+
+  // Index just past the `)` matching the `(` at openIndex, honouring quotes.
+  private balanced(openIndex: number): number {
+    const s = this.s;
+    let depth = 0;
+    for (let j = openIndex; j < s.length; j += 1) {
+      const c = s[j];
+      if (c === "\\") { j += 1; continue; }
+      if (c === "'") { const end = s.indexOf("'", j + 1); j = end < 0 ? s.length : end; continue; }
+      if (c === '"') { j += 1; while (j < s.length && s[j] !== '"') j += s[j] === "\\" ? 2 : 1; continue; }
+      if (c === "(") depth += 1;
+      else if (c === ")") { depth -= 1; if (depth === 0) return j + 1; }
+    }
+    return s.length;
+  }
+
+  // Collects command substitutions inside text that the shell expands (heredoc
+  // bodies, ${...}, arithmetic).
+  private scanExpansions(text: string): void {
+    const sub = new Lexer(text);
+    sub.readDouble(null);
+    this.nested.push(...sub.nested);
+  }
+}
+
+type Options = { opts: Array<[string, string | true]>; positionals: Word[]; rest: number };
+
+// Parses getopt-style options. `value` letters take an argument (rest of the
+// cluster or the next word), `optional` letters take only the rest of the
+// cluster, `digits` letters take trailing digits. Without `permute`, parsing
+// stops at the first positional and `rest` is its index.
+function parseOptions(args: Word[], spec: { value?: string; optional?: string; digits?: string; long?: string[]; permute?: boolean }): Options {
+  const value = spec.value ?? "";
+  const optional = spec.optional ?? "";
+  const digits = spec.digits ?? "";
+  const long = new Set(spec.long ?? []);
+  const opts: Array<[string, string | true]> = [];
+  const positionals: Word[] = [];
+  let index = 0;
+  for (; index < args.length; index += 1) {
+    const arg = args[index]?.text ?? "";
+    if (arg === "--") { index += 1; if (spec.permute) positionals.push(...args.slice(index)); break; }
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=");
+      if (eq >= 0) opts.push([arg.slice(0, eq), arg.slice(eq + 1)]);
+      else if (long.has(arg)) { opts.push([arg, args[index + 1]?.text ?? ""]); index += 1; }
+      else opts.push([arg, true]);
+      continue;
+    }
+    if (arg.startsWith("-") && arg.length > 1) {
+      for (let position = 1; position < arg.length; position += 1) {
+        const letter = arg[position] ?? "";
+        const rest = arg.slice(position + 1);
+        if (optional.includes(letter)) { opts.push([`-${letter}`, rest]); break; }
+        if (digits.includes(letter)) { const run = /^[0-9a-fA-Fx]*/.exec(rest)?.[0] ?? ""; opts.push([`-${letter}`, run]); position += run.length; continue; }
+        if (value.includes(letter)) {
+          if (rest) opts.push([`-${letter}`, rest]);
+          else { opts.push([`-${letter}`, args[index + 1]?.text ?? ""]); index += 1; }
+          break;
+        }
+        opts.push([`-${letter}`, true]);
+      }
+      continue;
+    }
+    if (!spec.permute) break;
+    positionals.push(args[index] as Word);
+  }
+  return { opts, positionals: spec.permute ? positionals : args.slice(index), rest: index };
+}
+
+const has = (parsed: Options, ...names: string[]): boolean => parsed.opts.some(([name]) => names.includes(name));
+const values = (parsed: Options, ...names: string[]): string[] => parsed.opts.filter(([name, value]) => names.includes(name) && value !== true).map(([, value]) => value as string);
+
+function assessText(command: string, depth: number): string | null {
+  if (depth > MAX_DEPTH) return "命令嵌套过深，无法静态判断";
+  const lexer = new Lexer(command).run();
+  for (const inner of lexer.nested) {
+    const reason = assessText(inner, depth + 1);
+    if (reason) return reason;
+  }
+  for (const segment of lexer.segments) {
+    const reason = assessSegment(segment, depth);
+    if (reason) return reason;
+  }
+  return null;
+}
+
+function assessSegment(segment: Segment, depth: number): string | null {
+  for (const redirect of segment.redirects) {
+    const writes = WRITE_REDIRECTS.has(redirect.op) || (redirect.op === ">&" && !/^(?:\d+|-)$/.test(redirect.target.text));
+    if (writes && (redirect.target.glob || !isSafeTarget(redirect.target.text))) return `输出重定向会写入文件：${show(redirect.target.text) || "(空)"}`;
+  }
+  const stdin: Stdin = { texts: [...segment.stdin], unknown: false };
+  if (segment.pipedFrom) {
+    const piped = staticEcho(segment.pipedFrom);
+    if (piped === null) stdin.unknown = true;
+    else stdin.texts.push(piped);
+  }
+  return assessWords(segment.words, depth, stdin);
+}
+
+// Output of a preceding `echo`/`printf` with literal arguments, or null when the
+// piped data cannot be known.
+function staticEcho(segment: Segment): string | null {
+  const [name, ...args] = segment.words.map((word) => word.text);
+  if ((name !== "echo" && name !== "printf") || args.some(isDynamic)) return null;
+  return args.filter((arg) => !/^-[neE]+$/.test(arg)).join(" ").replace(/\\n/g, "\n");
+}
+
+function assessWords(words: Word[], depth: number, stdin: Stdin): string | null {
+  if (depth > MAX_DEPTH) return "命令嵌套过深，无法静态判断";
+  let index = 0;
+  while (index < words.length && (ASSIGNMENT.test(words[index]?.text ?? "") || RESERVED_SKIP.has(words[index]?.text ?? ""))) index += 1;
+  const nameWord = words[index];
+  if (!nameWord || BLOCK_START.has(nameWord.text)) return null;
+  if (isDynamic(nameWord.text) || nameWord.glob) return "命令名是动态生成的（变量、命令替换、通配符或转义），可能隐藏删除操作";
+  const name = nameWord.text.split("/").pop() ?? nameWord.text;
+  return assessCommandName(name, words.slice(index + 1), depth, stdin);
+}
+
+function assessCode(name: string, codes: string[], depth: number): string | null {
+  for (const code of codes) {
+    if (isDynamic(code)) return `${name} 内联代码包含动态内容，可能隐藏删除操作`;
+    if (INLINE_WRITE.test(code)) return `${name} 内联代码会写入或删除文件`;
+    if (INLINE_SPAWN.test(code)) {
+      for (const literal of code.matchAll(/'([^'\n]*)'|"((?:[^"\\\n]|\\.)*)"|`([^`]*)`/g)) {
+        const reason = assessText(literal[1] ?? literal[2] ?? literal[3] ?? "", depth + 1);
+        if (reason) return reason;
+      }
     }
   }
-  return false;
+  return null;
 }
 
-function firstNonFlag(args: string[], valueFlags: Set<string>): string {
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index] ?? "";
-    if (arg === "--") return args[index + 1] ?? "";
-    if (valueFlags.has(arg)) { index += 1; continue; }
-    if (arg.startsWith("-")) continue;
-    return arg;
+// Interpreter given neither inline code nor a script: it runs whatever arrives on stdin.
+function assessStdinCode(name: string, stdin: Stdin, depth: number, shell: boolean): string | null {
+  if (stdin.unknown) return `${name} 执行来自管道的未知代码，可能隐藏删除操作`;
+  for (const text of stdin.texts) {
+    const reason = shell ? assessText(text, depth + 1) : assessCode(name, [text], depth);
+    if (reason) return reason;
   }
-  return "";
+  return null;
 }
 
-function hasAnyFlag(args: string[], flags: Set<string>): boolean {
-  return args.some((arg) => flags.has(arg) || (arg.startsWith("-") && !arg.startsWith("--") && [...flags].some((flag) => flag.length === 2 && arg.slice(1).includes(flag.slice(1)))));
-}
-
-function assessGit(args: string[]): CommandCategory {
-  const sub = firstNonFlag(args, new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"]));
-  if (!sub) return "read";
-  const read = new Set([
-    "status", "log", "diff", "show", "rev-parse", "describe", "blame", "ls-files",
-    "ls-tree", "shortlog", "reflog", "cat-file", "check-ignore", "grep", "annotate",
-    "version", "help", "whatchanged", "count-objects", "verify-commit", "verify-tag",
-  ]);
-  if (read.has(sub)) return "read";
-  if (sub === "branch" || sub === "tag") {
-    return hasAnyFlag(args, new Set(["-d", "-D", "-m", "-M", "-c", "-C", "-f"])) ? "mutating" : "read";
-  }
-  if (sub === "remote") {
-    const action = args.find((arg) => ["add", "remove", "rm", "rename", "set-url", "set-head", "set-branches", "prune"].includes(arg));
-    return action ? "mutating" : "read";
-  }
-  if (sub === "stash") {
-    const action = args.find((arg) => !arg.startsWith("-"));
-    return action === "list" || action === "show" ? "read" : "mutating";
-  }
-  if (sub === "config") {
-    return hasAnyFlag(args, new Set(["--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin", "--show-scope"])) ? "read" : "mutating";
-  }
-  if (sub === "hash-object") return hasAnyFlag(args, new Set(["-w"])) ? "mutating" : "read";
-  return "mutating";
-}
-
-function assessPackageManager(name: string, args: string[]): CommandCategory {
-  const sub = firstNonFlag(args, new Set(["--prefix", "--cwd", "-C", "--filter"]));
-  if (!sub) return "read";
-  if (sub === "test" || sub === "t") return "test";
-  if (sub === "run" || sub === "run-script" || sub === "exec" || sub === "x") {
-    const script = args.find((arg) => !arg.startsWith("-") && arg !== sub) ?? "";
-    if (/^(test|tests|test:.+|lint|lint:.+|typecheck|type-check|check|check:.+|validate|verify|audit|format:check)$/i.test(script)) return "test";
-    if (/^(build|compile|bundle|package|release|deploy|publish|prepare|prepublish|postinstall|preinstall)$/i.test(script)) return "mutating";
-    return "unknown";
-  }
-  if (["list", "ls", "view", "info", "show", "outdated", "explain", "why", "ping", "doctor", "root", "prefix", "bin", "help", "licenses", "fund"].includes(sub)) return "read";
-  if (sub === "audit") return args.includes("fix") ? "mutating" : "read";
-  if (sub === "config" || sub === "get") return args.includes("set") || args.includes("delete") ? "mutating" : "read";
-  if (name === "bun" && sub === "pm") {
-    const pmSub = args.find((arg) => !arg.startsWith("-") && arg !== "pm") ?? "";
-    return pmSub === "ls" || pmSub === "list" ? "read" : "mutating";
-  }
-  if (["install", "i", "add", "remove", "rm", "uninstall", "update", "upgrade", "ci", "publish", "link", "unlink", "dedupe", "prune", "patch", "patch-commit", "set", "delete", "create", "init", "rebuild", "reinstall", "pack", "version"].includes(sub)) return "mutating";
-  return "unknown";
-}
-
-function assessInterpreter(name: string, args: string[]): CommandCategory {
-  if (SHELL_INTERPRETERS.has(name)) return "mutating";
-  const inlineFlags = INLINE_CODE_FLAGS.get(name);
-  if (inlineFlags && args.some((arg) => inlineFlags.has(arg))) return "mutating";
-  if (name === "deno" && args[0] === "run") return "mutating";
-  if (name === "python" || name === "python3") {
-    if (args.some((arg) => arg === "-m" && ["pytest", "unittest"].includes(args[args.indexOf(arg) + 1] ?? ""))) return "test";
-    if (args[0] === "-m") return "unknown";
-  }
-  return "unknown";
-}
-
-function hasFileMutation(segment: string): boolean {
-  if (hasOutputRedirection(segment)) return true;
-  const { name, args } = extractBaseCommand(segment);
-  const direct = new Set(["rm", "rmdir", "unlink", "shred", "truncate", "dd", "mv", "cp", "install", "rsync", "scp", "sftp", "tee", "touch", "mkdir", "mknod", "ln", "link", "rename", "zip", "unzip", "gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "7z", "cpio", "patch"]);
-  if (direct.has(name)) return true;
-  if (name === "sed" && hasAnyFlag(args, new Set(["-i", "--in-place"]))) return true;
-  if ((name === "awk" || name === "gawk") && hasAnyFlag(args, new Set(["-i", "--include"])) && args.includes("inplace")) return true;
-  if (name === "find" && hasAnyFlag(args, new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"]))) return true;
-  if (name === "tar") {
-    const flag = args.find((arg) => arg.startsWith("-") && !arg.startsWith("--")) ?? "";
-    if (/[xcruAd]/.test(flag.slice(1))) return true;
-  }
-  if ((name === "curl" && hasAnyFlag(args, new Set(["-o", "-O", "--output", "--remote-name"]))) || (name === "wget" && hasAnyFlag(args, new Set(["-O", "-o", "-P", "--output-document", "--output-file", "--directory-prefix"])))) return true;
-  if (SHELL_INTERPRETERS.has(name) || INLINE_CODE_FLAGS.has(name) || name === "deno") {
-    return /(?:>>?|&>)(?!&(?:\d+|-))|\b(?:rm|rmdir|unlink|shred|truncate|dd|mv|cp|install|tee|touch|mkdir|mkdirp|writeFile|writeFileSync|appendFile|appendFileSync|unlinkSync|rmSync|rmdirSync|renameSync|copyFileSync|write_text|write_bytes)\b|find\s+[^\n]*\-(?:delete|exec)|sed\s+[^\n]*\-i/i.test(segment);
-  }
-  if (COMMAND_SUBSTITUTION.test(segment)) return /\b(?:rm|rmdir|unlink|shred|truncate|dd|mv|cp|install|tee|touch|mkdir|writeFile|writeFileSync|appendFile|appendFileSync|unlinkSync|rmSync|rmdirSync|renameSync|copyFileSync)\b/i.test(segment);
-  if (name === "git") {
-    const sub = firstNonFlag(args, new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"]));
-    return ["checkout", "restore", "reset", "clean", "apply", "am", "merge", "rebase", "cherry-pick"].includes(sub);
-  }
-  return false;
-}
-
-function assessSegment(segment: string): { category: CommandCategory; reason: string } {
-  const { name, args } = extractBaseCommand(segment);
-  if (!name) return { category: "unknown", reason: "空命令段" };
-  if (hasOutputRedirection(segment)) return { category: "mutating", reason: `输出重定向会写入文件：${name}` };
-  if (COMMAND_SUBSTITUTION.test(segment)) return { category: "unknown", reason: "包含命令替换或进程替换，无法静态确认" };
-  if (SHELL_INTERPRETERS.has(name)) return { category: "mutating", reason: `通过 ${name} 执行内联脚本` };
-  const inlineFlags = INLINE_CODE_FLAGS.get(name);
-  if (inlineFlags && args.some((arg) => inlineFlags.has(arg))) return { category: "mutating", reason: `${name} 内联代码执行` };
-  if (INLINE_CODE_FLAGS.has(name) || name === "deno") {
-    const category = assessInterpreter(name, args);
-    return { category, reason: category === "test" ? "解释器测试命令" : category === "mutating" ? "解释器内联执行" : `${name} 脚本执行需要确认` };
-  }
-  if (name === "find" && hasAnyFlag(args, new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"]))) return { category: "mutating", reason: "find 带有删除或执行动作" };
-  if (name === "sed" && hasAnyFlag(args, new Set(["-i", "--in-place"]))) return { category: "mutating", reason: "sed 原地修改文件" };
-  if ((name === "awk" || name === "gawk") && hasAnyFlag(args, new Set(["-i", "--include"])) && args.includes("inplace")) return { category: "mutating", reason: "awk 原地修改文件" };
-  if (name === "tar") {
-    const flag = args.find((arg) => arg.startsWith("-") && !arg.startsWith("--")) ?? "";
-    if (/[xcuraAd]/.test(flag.slice(1))) return { category: "mutating", reason: "tar 会写入文件" };
-    return { category: "read", reason: "tar 只读列表" };
-  }
-  if (name === "git") { const category = assessGit(args); return { category, reason: category === "read" ? "git 只读子命令" : "git 会修改仓库状态" }; }
-  if (name === "npm" || name === "pnpm" || name === "yarn" || name === "bun") {
-    const category = assessPackageManager(name, args);
-    return { category, reason: category === "read" ? `${name} 只读子命令` : category === "test" ? `${name} 测试命令` : `${name} 会修改项目或依赖` };
-  }
-  if (name === "go") {
-    const sub = firstNonFlag(args, new Set(["-C"]));
-    return sub === "test" ? { category: "test", reason: "go test" } : sub === "env" || sub === "version" || sub === "list" || sub === "doc" ? { category: "read", reason: "go 只读子命令" } : { category: "mutating", reason: "go 会写入构建产物或依赖" };
-  }
-  if (name === "cargo") {
-    const sub = firstNonFlag(args, new Set(["--manifest-path", "--config", "-Z"]));
-    return sub === "test" ? { category: "test", reason: "cargo test" } : sub === "metadata" || sub === "tree" || sub === "version" ? { category: "read", reason: "cargo 只读子命令" } : { category: "mutating", reason: "cargo 会写入构建产物或依赖" };
-  }
-  if (name === "docker" || name === "podman") {
-    const sub = firstNonFlag(args, new Set(["--context", "-H", "--host", "--config", "--log-level"]));
-    if (["ps", "images", "inspect", "logs", "version", "info", "stats", "top", "port", "history", "diff", "events", "search"].includes(sub)) return { category: "read", reason: "容器只读子命令" };
-    if (sub === "system" || sub === "image" || sub === "container") {
-      const nested = args.find((arg) => !arg.startsWith("-") && arg !== sub) ?? "";
-      if (["df", "info", "ls", "list", "inspect"].includes(nested)) return { category: "read", reason: "容器只读子命令" };
+function assessShell(name: string, args: Word[], depth: number, stdin: Stdin): string | null {
+  let index = 0;
+  let commandMode = false;
+  let stdinMode = false;
+  for (; index < args.length; index += 1) {
+    const arg = args[index]?.text ?? "";
+    if (arg === "--" || arg === "-") { index += 1; break; }
+    if (arg.startsWith("--")) { if (arg === "--rcfile" || arg === "--init-file") index += 1; continue; }
+    if (!/^[-+]./.test(arg)) break;
+    for (const letter of arg.slice(1)) {
+      if (letter === "c") commandMode = true;
+      if (letter === "s") stdinMode = true;
+      if (letter === "o" || letter === "O") index += 1;
     }
-    return { category: "mutating", reason: "容器命令会修改运行状态" };
   }
-  if (name === "kubectl") {
-    const sub = firstNonFlag(args, new Set(["--context", "--namespace", "-n", "--kubeconfig", "--cluster", "--user"]));
-    if (["get", "describe", "logs", "version", "api-resources", "api-versions", "explain", "cluster-info", "top", "events", "auth"].includes(sub)) return { category: "read", reason: "kubectl 只读子命令" };
-    if (sub === "config") {
-      const nested = args.find((arg) => !arg.startsWith("-") && arg !== sub) ?? "";
-      return nested === "view" ? { category: "read", reason: "kubectl config view" } : { category: "mutating", reason: "kubectl config 会写入配置" };
+  const first = args[index];
+  if (commandMode) {
+    if (!first) return null;
+    return isDynamic(first.text) ? `${name} -c 执行动态生成的命令，可能隐藏删除操作` : assessText(first.text, depth + 1);
+  }
+  if (first && !stdinMode) return isDynamic(first.text) ? `${name} 执行动态生成的脚本，可能隐藏删除操作` : null;
+  return assessStdinCode(name, stdin, depth, true);
+}
+
+function assessInterpreter(name: string, args: Word[], depth: number, stdin: Stdin): string | null | undefined {
+  let parsed: Options;
+  let codeFlags: string[];
+  if (/^(?:python[0-9.]*|pypy3?)$/.test(name)) {
+    parsed = parseOptions(args, { value: "cWXmQ" });
+    if (has(parsed, "-m")) return null;
+    codeFlags = ["-c"];
+  } else if (name === "perl") {
+    parsed = parseOptions(args, { value: "eEIMmxCdD", optional: "iF", digits: "l0" });
+    if (has(parsed, "-i")) return "perl -i 会原地修改文件";
+    codeFlags = ["-e", "-E"];
+  } else if (name === "ruby") {
+    parsed = parseOptions(args, { value: "eIrEC", optional: "iFTx", digits: "0l" });
+    if (has(parsed, "-i")) return "ruby -i 会原地修改文件";
+    codeFlags = ["-e"];
+  } else if (name === "node" || name === "nodejs" || name === "bun") {
+    parsed = parseOptions(args, { value: "eprC", long: ["--eval", "--print", "--require", "--import", "--loader", "--input-type", "--conditions"] });
+    codeFlags = ["-e", "-p", "--eval", "--print"];
+    if (name === "bun" && parsed.positionals.length && !values(parsed, ...codeFlags).length) return null;
+  } else if (name === "deno") {
+    if (args[0]?.text !== "eval") return null;
+    return assessCode(name, args.slice(1).map((word) => word.text).filter((arg) => !arg.startsWith("-")), depth);
+  } else if (name === "php") {
+    parsed = parseOptions(args, { value: "rfcdzBREF" });
+    codeFlags = ["-r", "-B", "-R", "-E", "-F"];
+  } else if (name === "lua") {
+    parsed = parseOptions(args, { value: "el" });
+    codeFlags = ["-e"];
+  } else {
+    return undefined;
+  }
+  const codes = values(parsed, ...codeFlags);
+  if (codes.length) return assessCode(name, codes, depth);
+  const script = parsed.positionals[0];
+  if (script && script.text !== "-") return isDynamic(script.text) ? `${name} 执行动态生成的脚本，可能隐藏删除操作` : null;
+  return assessStdinCode(name, stdin, depth, false);
+}
+
+function assessAwk(name: string, args: Word[], depth: number): string | null {
+  const parsed = parseOptions(args, { value: "fvFiEl", long: ["--file", "--assign", "--field-separator", "--include", "--load", "--exec", "--source"] });
+  if (values(parsed, "-i", "--include").some((value) => /^inplace(?:\.awk)?$/.test(value))) return `${name} -i inplace 会原地修改文件`;
+  const programs = values(parsed, "--source");
+  if (!has(parsed, "-f", "--file", "-E", "--exec") && parsed.positionals[0]) programs.push(parsed.positionals[0].text);
+  for (const program of programs) {
+    if (isDynamic(program)) return `${name} 程序包含动态内容，可能隐藏写入操作`;
+    let flat = program;
+    for (let previous = ""; previous !== flat;) { previous = flat; flat = flat.replace(/\([^()]*\)/g, ""); }
+    for (const match of flat.matchAll(/\bprintf?\b[^;{}\n]*?(>>?|\|)\s*(?:"([^"]*)"|(\S+))/g)) {
+      if (match[1] === "|") {
+        const reason = match[2] === undefined ? `${name} 把输出交给动态命令执行` : assessText(match[2], depth + 1);
+        if (reason) return reason;
+      } else if (match[2] === undefined || !SAFE_TARGET.test(match[2])) {
+        return `${name} 输出重定向会写入文件`;
+      }
     }
-    return { category: "mutating", reason: "kubectl 会修改集群状态" };
+    if (/\bsystem\s*\(|\|\s*getline/.test(program)) {
+      for (const literal of program.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+        const reason = assessText(literal[1] ?? "", depth + 1);
+        if (reason) return reason;
+      }
+    }
   }
-  if (name === "systemctl") {
-    const sub = firstNonFlag(args, new Set(["--type", "-t", "--state", "--property", "-p", "--user", "--machine", "-M"]));
-    if (["status", "is-active", "is-enabled", "is-failed", "show", "list-units", "list-unit-files", "cat", "list-timers", "list-sockets", "help"].includes(sub)) return { category: "read", reason: "systemctl 只读子命令" };
-    return { category: "mutating", reason: "systemctl 会修改服务状态" };
+  return null;
+}
+
+function assessTar(args: Word[]): string | null {
+  const texts = args.map((word) => word.text);
+  let modes = "";
+  let archive: string | undefined;
+  let toStdout = false;
+  const valueLetters = "fCbTXgKNVLHI";
+  const pending: string[] = [];
+  let start = 0;
+  if (texts[0] && !texts[0].startsWith("-")) {
+    // Old-style cluster (`tar xzf a.tar`): value letters consume the following words in order.
+    for (const letter of texts[0]) {
+      if ("xcruAtd".includes(letter)) modes += letter;
+      if (letter === "O") toStdout = true;
+      if (valueLetters.includes(letter)) pending.push(letter);
+    }
+    start = 1;
+    for (const letter of pending) { if (letter === "f") archive = texts[start]; start += 1; }
   }
-  if (name === "curl") {
-    if (hasAnyFlag(args, new Set(["-o", "-O", "-T", "--output", "--remote-name", "--upload-file", "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "-F", "--form", "--post-data"]))) return { category: "mutating", reason: "curl 会写入文件或发送数据" };
-    const method = args.find((arg) => arg === "-X" || arg === "--request");
-    if (method && args[args.indexOf(method) + 1] && !/^GET$/i.test(args[args.indexOf(method) + 1] ?? "")) return { category: "mutating", reason: "curl 非 GET 请求" };
-    return { category: "read", reason: "curl 只读请求" };
+  const longModes: Record<string, string> = { "--extract": "x", "--get": "x", "--create": "c", "--append": "r", "--update": "u", "--catenate": "A", "--concatenate": "A", "--list": "t", "--diff": "d", "--compare": "d" };
+  const parsed = parseOptions(args.slice(start), { value: valueLetters, long: ["--file", "--directory", "--files-from", "--exclude-from"], permute: true });
+  for (const [name, value] of parsed.opts) {
+    if (name === "--delete") return "tar --delete 会修改归档文件";
+    if (name === "-O" || name === "--to-stdout") toStdout = true;
+    if ((name === "-f" || name === "--file") && value !== true) archive = value;
+    if (longModes[name]) modes += longModes[name];
+    if (/^-[xcruAtd]$/.test(name)) modes += name.slice(1);
   }
-  if (name === "wget") {
-    if (hasAnyFlag(args, new Set(["-O", "-o", "-P", "--output-document", "--output-file", "--directory-prefix", "--post-data", "--post-file", "--method"]))) return { category: "mutating", reason: "wget 会写入文件或发送数据" };
-    return { category: "read", reason: "wget 只读请求" };
+  if (modes.includes("x") && !toStdout) return "tar 解包会写入文件";
+  if (/[cruA]/.test(modes) && archive !== undefined && archive !== "-" && !isSafeTarget(archive)) return "tar 会写入归档文件";
+  return null;
+}
+
+function assessGit(args: Word[], depth: number): string | null {
+  const parsed = parseOptions(args, { value: "Cc", long: ["--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"] });
+  for (const config of values(parsed, "-c")) {
+    const shellAlias = config.indexOf("=!");
+    if (shellAlias >= 0) { const reason = assessText(config.slice(shellAlias + 2), depth + 1); if (reason) return reason; }
   }
-  if (name === "ip" || name === "hostnamectl" || name === "timedatectl" || name === "localectl") {
-    const sub = firstNonFlag(args, new Set());
-    if (["addr", "address", "route", "link", "neigh", "rule", "show", "status", "get-default", "list-timezones", "list-locales", "list-keymaps"].includes(sub) || !sub) return { category: "read", reason: `${name} 只读子命令` };
-    return { category: "mutating", reason: `${name} 会修改系统状态` };
+  const sub = parsed.positionals[0]?.text ?? "";
+  const rest = parsed.positionals.slice(1).map((word) => word.text);
+  if (isDynamic(sub)) return "git 子命令是动态生成的，可能隐藏删除操作";
+  const reason = `git ${sub} 会修改或删除文件`;
+  if (GIT_WRITE.has(sub)) return reason;
+  if (sub === "stash") { const action = rest.find((arg) => !arg.startsWith("-")); return action === "list" || action === "show" ? null : reason; }
+  if (sub === "reset") return rest.some((arg) => arg === "--hard" || arg === "--merge" || arg === "--keep") ? reason : null;
+  if (sub === "apply") return rest.some((arg) => ["--check", "--stat", "--numstat", "--summary"].includes(arg)) ? null : reason;
+  if (sub === "worktree") return ["add", "remove", "move", "prune"].includes(rest[0] ?? "") ? reason : null;
+  return null;
+}
+
+function assessCommandName(name: string, args: Word[], depth: number, stdin: Stdin): string | null {
+  const wrapped = (from: number): string | null => (from >= args.length ? null : assessWords(args.slice(from), depth + 1, stdin));
+  const writes = `${name} 会写入或删除文件`;
+  const unsafe = (list: string[]): boolean => list.some((value) => !isSafeTarget(value));
+  switch (name) {
+    case "sudo": {
+      const parsed = parseOptions(args, { value: "ughpCDrtTUR", long: ["--user", "--group", "--host", "--prompt", "--close-from", "--chdir", "--role", "--type", "--other-user", "--command-timeout", "--chroot"] });
+      if (has(parsed, "-e", "--edit")) return "sudo -e 会编辑文件";
+      if (has(parsed, "-l", "--list", "-v", "--validate", "-k", "-K")) return null;
+      return wrapped(parsed.rest);
+    }
+    case "doas": return wrapped(parseOptions(args, { value: "uC" }).rest);
+    case "timeout": return wrapped(parseOptions(args, { value: "sk", long: ["--signal", "--kill-after"] }).rest + 1);
+    case "env": {
+      const parsed = parseOptions(args, { value: "uCS", long: ["--unset", "--chdir", "--split-string"] });
+      for (const split of values(parsed, "-S", "--split-string")) {
+        const reason = isDynamic(split) ? "env -S 执行动态生成的命令" : assessText([split, ...args.slice(parsed.rest).map((word) => word.text)].join(" "), depth + 1);
+        if (reason) return reason;
+      }
+      return wrapped(parsed.rest);
+    }
+    case "xargs": return wrapped(parseOptions(args, { value: "nLPsIdEa", optional: "ile", long: ["--max-args", "--max-lines", "--max-procs", "--max-chars", "--delimiter", "--arg-file", "--process-slot-var"] }).rest);
+    case "nice": return wrapped(parseOptions(args, { value: "n", long: ["--adjustment"] }).rest);
+    case "ionice": {
+      const parsed = parseOptions(args, { value: "cnp", long: ["--class", "--classdata", "--pid", "--pgid", "--uid"] });
+      return has(parsed, "-p", "--pid", "--pgid", "--uid") ? null : wrapped(parsed.rest);
+    }
+    case "stdbuf": return wrapped(parseOptions(args, { value: "ioe", long: ["--input", "--output", "--error"] }).rest);
+    case "time": {
+      const parsed = parseOptions(args, { value: "fo", long: ["--format", "--output"] });
+      if (unsafe(values(parsed, "-o", "--output"))) return "time -o 会写入文件";
+      return wrapped(parsed.rest);
+    }
+    case "exec": return wrapped(parseOptions(args, { value: "a" }).rest);
+    case "command": {
+      const parsed = parseOptions(args, {});
+      return has(parsed, "-v", "-V") ? null : wrapped(parsed.rest);
+    }
+    case "nohup": case "builtin": case "busybox": case "setsid": case "chronic": case "unbuffer":
+      return wrapped(parseOptions(args, {}).rest);
+    case "chroot": return wrapped(parseOptions(args, { long: ["--userspec", "--groups"] }).rest + 1);
+    case "watch": {
+      const parsed = parseOptions(args, { value: "nq", long: ["--interval"] });
+      const rest = args.slice(parsed.rest).map((word) => word.text);
+      if (rest.some(isDynamic)) return "watch 执行动态生成的命令";
+      return rest.length ? assessText(rest.join(" "), depth + 1) : null;
+    }
+    case "su": {
+      const parsed = parseOptions(args, { value: "cgGsw", long: ["--command", "--session-command", "--shell", "--group", "--supp-group", "--whitelist-environment"] });
+      for (const command of values(parsed, "-c", "--command", "--session-command")) {
+        const reason = isDynamic(command) ? "su -c 执行动态生成的命令" : assessText(command, depth + 1);
+        if (reason) return reason;
+      }
+      return null;
+    }
+    case "eval": {
+      const text = args.map((word) => word.text).join(" ");
+      return isDynamic(text) ? "eval 执行动态生成的内容，可能隐藏删除操作" : assessText(text, depth + 1);
+    }
+    case "trap": {
+      const action = args[0]?.text ?? "";
+      if (!action || action.startsWith("-")) return null;
+      return isDynamic(action) ? "trap 注册了动态生成的命令" : assessText(action, depth + 1);
+    }
+    case "source": case ".":
+      return args.some((word) => isDynamic(word.text)) ? "source 执行动态生成的脚本，可能隐藏删除操作" : null;
+    case "find":
+      for (let index = 0; index < args.length; index += 1) {
+        const arg = args[index]?.text ?? "";
+        if (arg === "-delete") return "find -delete 会删除文件";
+        if (["-fprint", "-fprint0", "-fprintf", "-fls"].includes(arg) && !isSafeTarget(args[index + 1]?.text ?? "")) return `find ${arg} 会写入文件`;
+        if (["-exec", "-execdir", "-ok", "-okdir"].includes(arg)) {
+          let end = index + 1;
+          while (end < args.length && args[end]?.text !== ";" && args[end]?.text !== "+") end += 1;
+          const reason = assessWords(args.slice(index + 1, end).map((word) => (word.text === "{}" ? { text: "FILE", glob: false, quoted: true } : word)), depth + 1, { texts: [], unknown: false });
+          if (reason) return reason;
+          index = end;
+        }
+      }
+      return null;
+    case "sed": {
+      const parsed = parseOptions(args, { value: "efl", optional: "i", long: ["--expression", "--file", "--line-length"], permute: true });
+      if (has(parsed, "-i", "--in-place")) return "sed -i 会原地修改文件";
+      const scripts = values(parsed, "-e", "--expression");
+      if (!scripts.length && !has(parsed, "-f", "--file") && parsed.positionals[0]) scripts.push(parsed.positionals[0].text);
+      return scripts.some((script) => /(?:^|[;\n{}])\s*[0-9,$]*\s*[wW]\s+\S|\/[gpiImMe0-9]*w\s+\S/.test(script)) ? "sed 的 w 命令会写入文件" : null;
+    }
+    case "awk": case "gawk": case "mawk": case "nawk": return assessAwk(name, args, depth);
+    case "tar": return assessTar(args);
+    case "git": return assessGit(args, depth);
+    case "dd": return args.some((word) => word.text.startsWith("of=") && !isSafeTarget(word.text.slice(3))) ? "dd of= 会写入文件" : null;
+    case "tee": return unsafe(parseOptions(args, { permute: true }).positionals.map((word) => word.text)) ? writes : null;
+    case "sort": case "shuf": {
+      const parsed = parseOptions(args, { value: name === "sort" ? "ktoST" : "noi", long: ["--output", "--key", "--field-separator", "--buffer-size", "--temporary-directory", "--files0-from", "--random-source", "--compress-program", "--batch-size", "--head-count", "--input-range"], permute: true });
+      return unsafe(values(parsed, "-o", "--output")) ? `${name} -o 会写入文件` : null;
+    }
+    case "uniq": {
+      const output = parseOptions(args, { value: "fsw", long: ["--skip-fields", "--skip-chars", "--check-chars"], permute: true }).positionals[1];
+      return output && !isSafeTarget(output.text) ? "uniq 会写入输出文件" : null;
+    }
+    case "curl": {
+      const parsed = parseOptions(args, { value: "AbcCdDeEFHKmoPQrtTuUwxXYyz", long: ["--output", "--dump-header", "--cookie-jar", "--trace", "--trace-ascii", "--stderr", "--libcurl", "--etag-save", "--config", "--data", "--header", "--request", "--user", "--user-agent", "--form", "--upload-file", "--max-time", "--proxy", "--cookie", "--range", "--referer", "--write-out", "--connect-timeout", "--retry", "--resolve", "--data-raw", "--data-binary", "--data-urlencode", "--url"], permute: true });
+      if (has(parsed, "-O", "--remote-name", "--remote-name-all")) return "curl -O 会把下载内容写入文件";
+      return unsafe(values(parsed, "-o", "--output", "-D", "--dump-header", "-c", "--cookie-jar", "--trace", "--trace-ascii", "--stderr", "--libcurl", "--etag-save").filter((value) => value !== "-")) ? "curl 会把内容写入文件" : null;
+    }
+    case "wget": {
+      const parsed = parseOptions(args, { value: "OoaPeitTwUBQlDARIX", long: ["--output-document", "--output-file", "--append-output", "--directory-prefix", "--execute", "--input-file", "--tries", "--timeout", "--wait", "--user-agent", "--header", "--post-data", "--post-file", "--method", "--body-data"], permute: true });
+      if (unsafe(values(parsed, "-o", "--output-file", "-a", "--append-output"))) return "wget 会写入日志文件";
+      if (has(parsed, "--spider")) return null;
+      const outputs = values(parsed, "-O", "--output-document");
+      return outputs.length && outputs.every((value) => value === "-" || isSafeTarget(value)) ? null : "wget 会把下载内容写入文件";
+    }
+    case "unzip": {
+      const parsed = parseOptions(args, { value: "dxP", permute: true });
+      return has(parsed, "-l", "-t", "-v", "-p", "-Z", "-z") ? null : writes;
+    }
+    case "7z": case "7za": case "7zr": case "7zz": return ["l", "t", "h", "i", "b"].includes(args[0]?.text ?? "") ? null : writes;
+    case "cpio": {
+      const parsed = parseOptions(args, { value: "FOIEHMRC", long: ["--file", "--format", "--owner", "--pattern-file"], permute: true });
+      if (has(parsed, "-t", "--list")) return null;
+      if (has(parsed, "-o", "--create") && !has(parsed, "-F", "-O", "--file")) return null;
+      return writes;
+    }
+    case "patch": return args.some((word) => word.text === "--dry-run") ? null : writes;
+    case "crontab": return args.some((word) => word.text === "-l") ? null : "crontab 会修改定时任务";
+    default: break;
   }
-  if (name === "service") return hasAnyFlag(args, new Set(["--status"])) ? { category: "read", reason: "service --status" } : { category: "mutating", reason: "service 会修改服务状态" };
-  if (name === "umask") return args.length === 0 ? { category: "read", reason: "umask 查询" } : { category: "read", reason: "umask 只影响当前子进程" };
-  if (TEST_COMMANDS.has(name)) return { category: "test", reason: `${name} 测试命令` };
-  if (READ_ONLY.has(name)) return { category: "read", reason: `${name} 只读命令` };
-  if (MUTATING.has(name)) return { category: "mutating", reason: `${name} 会修改系统` };
-  return { category: "unknown", reason: `未识别的命令：${name}` };
+  if (SHELLS.has(name)) return assessShell(name, args, depth, stdin);
+  const interpreted = assessInterpreter(name, args, depth, stdin);
+  if (interpreted !== undefined) return interpreted;
+  if (COMPRESSORS.has(name)) {
+    const parsed = parseOptions(args, { value: "S", long: ["--suffix"], permute: true });
+    return has(parsed, "-c", "--stdout", "--to-stdout", "-t", "--test", "-l", "--list") || !parsed.positionals.length ? null : writes;
+  }
+  if (SQL_CLIENTS.has(name)) {
+    const text = [...args.map((word) => word.text), ...stdin.texts].join(" ");
+    return /\b(?:insert|update|delete|drop|alter|truncate|create|replace|vacuum|grant|revoke)\b/i.test(text) ? "数据库命令会写入或删除数据" : null;
+  }
+  if (ALWAYS_WRITE.has(name) || name.startsWith("mkfs")) return writes;
+  return null;
 }
 
 export function assessCommand(command: string): CommandAssessment {
-  const trimmed = command.trim();
-  if (!trimmed) return { requiresConfirmation: true, category: "unknown", reason: "空命令" };
-  const segments = splitShellSegments(trimmed);
-  if (!segments.length) return { requiresConfirmation: true, category: "unknown", reason: "空命令" };
-  const results = segments.map((segment) => ({ segment, assessment: assessSegment(segment) }));
-  const fileMutation = results.find(({ segment }) => hasFileMutation(segment));
-  if (fileMutation) return { requiresConfirmation: true, category: "mutating", reason: fileMutation.assessment.reason };
-  const isTest = results.some((result) => result.assessment.category === "test");
-  const isUnknown = results.some((result) => result.assessment.category === "unknown");
-  return { requiresConfirmation: false, category: isTest ? "test" : isUnknown ? "unknown" : "read", reason: isTest ? "测试命令自动执行" : "非文件变更命令自动执行" };
+  if (!command.trim()) return { requiresConfirmation: true, reason: "空命令" };
+  const reason = assessText(command, 0);
+  return reason ? { requiresConfirmation: true, reason } : { requiresConfirmation: false, reason: "不写入或删除文件，自动执行" };
 }

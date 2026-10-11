@@ -18,7 +18,7 @@ git clone https://github.com/caichengle666/muse-file-manager-monitor.git
 cd muse-file-manager-monitor
 ```
 
-然后把仓库中的 `app/` 作为构件源码输入。复刻时必须复制 `app/client/`、`app/server/`、`app/drizzle/`、`app/space.json`、`app/bunfig.toml` 和 `app/tsconfig.base.json`；不要复制 `preview.html`，它只是本地静态预览文件，不属于构件运行时。
+然后把仓库中的 `app/` 作为构件源码输入。复刻时必须复制 `app/client/`、`app/server/`、`app/drizzle/`、`app/space.json`、`app/bunfig.toml` 和 `app/tsconfig.base.json`。
 
 如果已经在一个现有 skill 或构件目录中工作，先读取仓库最新的 `SKILL.md`、`references/architecture.md` 和 `app/` 源码，再开始重建，不要根据记忆重新猜测文件内容。
 
@@ -44,14 +44,15 @@ cd muse-file-manager-monitor
 1. 先读完本文件、`references/architecture.md` 和 `references/changelog.md`，重点看 changelog 里每个版本"为什么这么改"（比如：私有模式为什么从虚拟文件系统改成真实目录、"上一级"为什么放开、系统启动时间为什么改读 btime）。
 2. 在你的 Muse 里创建一个新的 web_fullstack artifact（名字和 slug 你自己定，不要沿用 `space-2`），把 `app/` 下的 `client/`（React 19 前端）和 `server/`（Bun 后端）源码完整交给构建器。**复刻模式下必须逐文件原样复用，不得重写或重新设计**；平台接口（`defineAction`、`definePrivilegedContracts`、`ctx.blobs`、drizzle 上下文）在同一 Muse 构件平台直接可用。
 3. 平台接口：本项目依赖构件平台注入的 `defineAction`、`definePrivilegedContracts`、`ctx.blobs` 和 drizzle 上下文——同一 Muse 构件平台上这些直接可用；换到别的平台，按 `references/architecture.md` 的"独立运行"节写适配层。
-4. 数据库：`app/drizzle/` 下有三个 migration（`meta/_journal.json` 登记执行顺序），都是幂等的 `CREATE TABLE IF NOT EXISTS`：
-   - `workspace_items.sql`：旧私有虚拟文件系统的表，v1.2 起业务已废弃（私有改成真实目录），但十几个旧 action 代码仍引用它，保留建表；
-   - `service_restart_record.sql`：服务重启记录表（累计次数/上次启动时间），监控页用。
-   - `ai_provider_config.sql`：外部 AI 服务配置表（兼容 OpenAI 的 base URL、API Key、模型、更新时间）；API Key 只由服务端读取，前端只显示是否已配置。
-5. AI 终端 Agent：复刻时必须保留 `getAiProviderConfig`、`saveAiProviderConfig`、`listAiModels`、`generateAiShellCommand`、`runAiTask` 这些 action。配置流程是：填写 OpenAI-compatible API 地址和 Key → 拉取模型 → 选择模型 → 保存到服务器；模型地址会经过公网校验（拒绝 localhost/私网/链路本地/.local）。Agent 流程是：自然语言任务 → 生成一条命令 → 在沙盒执行 → 把 stdout/stderr 回传模型 → 继续下一步，直到模型返回 `done=true`；需要确认时服务端返回一次性 `confirmToken`，前端确认后原样回传。**`runAiTask` 每次调用只做一件事**（要么问模型要命令，要么执行已排队命令），多步循环由前端反复调用驱动——不要把整个循环塞进一个请求，否则平台网关会报 `Gateway request timed out: spaces.cvm.post`。
-6. 命令权限：命令分类在 `server/src/commandPolicy.ts`；只有明确会写入、修改、移动或删除文件的命令需要确认（重定向、`rm`/`cp`/`mv`/`tee`、原地 `sed`、`find -delete/-exec`、解包、脚本中的文件写入等）。安装、Git、网络、服务、权限、容器、未知命令等其他操作自动执行。服务端会为待确认命令生成一次性 `confirmToken`，前端确认时必须回传，命令内容不匹配或令牌复用都会被拒绝；不要退回成客户端 `approvePending` 布尔值。单条命令最长 30 秒，超时后把结果回传 Agent 并结束该步。
-7. 构建完按这份清单验收：文件页四种模式浏览 / 新建 / 删除 / 重命名 / 上传 / 下载；点图片弹出深色查看器（缩放/1:1/下载/左右切换）；监控页 1 秒刷新、九项指标有数；终端能执行命令并返回结果；AI 配置可拉取模型并落盘；输入多步任务后 Agent 能读取命令输出继续下一步；修改/删除命令会暂停确认；重启服务后"累计重启次数"加 1。
-8. 安全：网页终端和 AI Agent 都是 RCE 级能力，只部署在你完全控制的私有环境，不要暴露到公网；敏感文件开关默认隐藏；公开仓库不要写入真实 API Key、主机名或路径。AI 模型地址必须通过 `requirePublicBaseUrl`（拒绝 localhost/私网/链路本地/.local，且禁用重定向）。API Key 明文落盘且配置接口会原样返回、前端以明文输入框展示，这是自用私有部署的有意选择，请把 `app.db` 当作密钥文件保护。Agent 任务有 30 分钟 TTL、单任务并发锁和 100 个任务上限，任务执行中不要重启服务（内存态会丢）。
+4. 数据库：`app/drizzle/` 下有四个 migration，全部登记在 `meta/_journal.json`，都是幂等的 `CREATE TABLE IF NOT EXISTS`：
+   - `service_restart_record.sql`：服务重启记录表（累计次数/上次启动时间），监控页用；
+   - `workspace_items.sql`：旧私有虚拟文件系统的表，私有模式已改成真实目录，只有一次性的 `migratePrivateWorkspace` 还读它；
+   - `ai_provider_config.sql`：外部 AI 服务配置表（兼容 OpenAI 的 base URL、API Key、模型、更新时间）；API Key 只由服务端读取，配置接口只返回是否已保存和打码提示；
+   - `ai_agent_context.sql`：AI 对话记录与服务端任务状态（重启后可恢复）。
+5. AI 终端 Agent：复刻时必须保留 `getAiProviderConfig`、`saveAiProviderConfig`、`listAiModels`、`runAiTask`、`getAiContext`、`saveAiContext`、`clearAiContext` 这些 action。配置流程是：填写 OpenAI-compatible API 地址和 Key → 拉取模型 → 选择模型 → 保存到服务器；模型地址会经过公网校验（拒绝 localhost/私网/链路本地/.local）。Agent 流程是：自然语言任务 → 生成一条命令 → 在沙盒执行 → 把 stdout/stderr 回传模型 → 继续下一步，直到模型返回 `done=true`；需要确认时服务端返回一次性 `confirmToken`，用户点「确认并执行」时原样回传，点「拒绝」或直接输入新要求则撤销该命令并把意见交给模型。**`runAiTask` 每次调用只做一件事**（要么问模型要命令，要么执行已排队命令），多步循环由前端反复调用驱动——不要把整个循环塞进一个请求，否则平台网关会报 `Gateway request timed out: spaces.cvm.post`。
+6. 命令权限（黑名单模型，作者的明确决定）：判断在 `server/src/commandPolicy.ts`；只有会写入、修改、移动或删除文件和数据的命令需要确认（写文件的重定向、`rm`/`cp`/`mv`/`tee`/`chmod`/`ln` 等、`sed -i`/`perl -i`/awk 输出重定向、`find -delete`、`tar x`、`git rm/mv/stash/checkout/restore/clean/reset --hard/pull/switch`、`wget`/`curl -o` 下载落盘、`python -c`/`node -e` 等内联代码里的写删调用、数据库写语句等）；读取、网络读取、进程查看、安装、服务、容器和未知命令自动执行，不要改成白名单。包装命令（`sudo -u X`、`timeout -s KILL 5`、`env -u X`、`xargs -n 1` 等）会被拆开检查真正的命令，`bash -c` 字符串和命令替换会递归检查；命令名本身动态（`$VAR`、`$(...)`、反引号、`$'..'`、`eval` 动态内容、管道喂给 shell 的未知脚本）一律需要确认。重定向到 `/dev/null` 和 `2>&1` 不算写入。这是尽力而为的静态检查，不是沙盒。服务端为待确认命令生成一次性 `confirmToken`（只存哈希），只对当前这条待执行命令有效，用后即焚，没有单独的过期时间（随任务 30 分钟 TTL 失效）；不要退回成客户端 `approvePending` 布尔值。单条命令最长 25 秒（低于 30 秒的特权合约超时），超时后杀掉整个进程组，把结果回传 Agent 并结束该步。
+7. 构建完按这份清单验收：文件页四种模式浏览 / 新建 / 删除 / 重命名 / 上传 / 下载；点图片弹出深色查看器（缩放/1:1/下载/左右切换）；监控页 1 秒刷新、九项指标有数；终端能执行命令并返回结果；AI 配置可拉取模型并落盘；输入多步任务后 Agent 能读取命令输出继续下一步；修改/删除命令会暂停确认，且可以拒绝；重启服务后"累计重启次数"加 1。
+8. 安全：网页终端和 AI Agent 都是 RCE 级能力，只部署在你完全控制的私有环境，不要暴露到公网；敏感文件开关默认隐藏；公开仓库不要写入真实 API Key、主机名或路径。AI 模型地址必须通过 `requirePublicBaseUrl`（拒绝 localhost/私网/链路本地/.local，且禁用重定向）。API Key 明文存在 `app.db`，只由服务端读取，配置接口只返回打码提示，前端用密码框且留空保存即沿用旧 Key；请把 `app.db` 当作密钥文件保护。确认令牌只防模型自行推进，不是访问控制：网页终端（`executeShell`）执行用户亲手输入的命令、不经确认，真正的访问控制只有平台登录。Agent 任务有 30 分钟 TTL、单任务并发锁和 100 个任务上限，每步结束后状态写入数据库，服务重启后可以继续。
 
 ## Operating Rules
 

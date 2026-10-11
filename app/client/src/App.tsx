@@ -13,6 +13,7 @@ XAxis,
 YAxis,
 } from "recharts";
 import { api, type ApiResponse } from "./api";
+import { SHELL_TIMEOUT_MS } from "../../server/src/shellExecution";
 
 type HostListing = ApiResponse<typeof api, "listHostDirectory">;
 type HostEntry = HostListing["entries"][number];
@@ -120,6 +121,9 @@ function formatLocalDateTime(iso: string): string {
     hour12: false,
   }).format(new Date(iso));
 }
+
+const SHELL_TIMEOUT_SECONDS = SHELL_TIMEOUT_MS / 1000;
+const CORE_COLORS = ["var(--accent)", "var(--amber)", "#2f7da5", "#b44d80"];
 
 function ActionButton({ children, onClick, disabled, tone = "neutral", ariaLabel }: { children: ReactNode; onClick?: () => void; disabled?: boolean; tone?: "neutral" | "accent" | "danger"; ariaLabel?: string }) {
   return <button type="button" className={`action-button action-${tone}`} onClick={onClick} disabled={disabled} aria-label={ariaLabel}>{children}</button>;
@@ -362,7 +366,7 @@ export function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${tab === "terminal" ? "is-terminal" : ""}`}>
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
       <header className="mode-header pt-safe">
         <div className="brand-mark"><span className="brand-mark-icon">M</span><span><strong>Muse</strong><small>FILE OPERATIONS</small></span></div>
@@ -373,7 +377,7 @@ export function App() {
         </nav>
         <div className="header-state" aria-live="polite">
           <span className={`status-dot ${tab === "monitor" && snapshot ? "live" : ""}`} />
-          {tab === "monitor" ? (snapshot ? `${formatTime(snapshot.sampledAt)} 采样` : "正在连接") : tab === "terminal" ? (terminalBusy ? "执行中" : "30 秒上限") : `${visibleFileCount} 项`}
+          <span>{tab === "monitor" ? (snapshot ? `${formatTime(snapshot.sampledAt)} 采样` : "正在连接") : tab === "terminal" ? (terminalBusy ? "执行中" : `${SHELL_TIMEOUT_SECONDS} 秒上限`) : `${visibleFileCount} 项`}</span>
         </div>
       </header>
 
@@ -383,11 +387,10 @@ export function App() {
           <div className="rail-title">运行控制台</div>
           <div className="rail-nav">
             <button className={tab === "files" ? "active" : ""} onClick={() => setTab("files")}><span>01</span>文件浏览</button>
-            <button className={tab === "monitor" ? "active" : ""} onClick={() => setTab("monitor")}><span>02</span>系统监控</button>
-            <button className={tab === "terminal" ? "active" : ""} onClick={() => setTab("terminal")}><span>03</span>网页终端</button>
+            <button className={tab === "terminal" ? "active" : ""} onClick={() => setTab("terminal")}><span>02</span>网页终端</button>
+            <button className={tab === "monitor" ? "active" : ""} onClick={() => setTab("monitor")}><span>03</span>系统监控</button>
           </div>
           <div className="rail-status"><span className="status-dot live" /><div><strong>服务在线</strong><small>本地沙盒运行环境</small></div></div>
-          <div className="rail-footer">MUSE / OPS<br />v0.1 workspace</div>
         </aside>
         <main className="content-wrap">
         {tab === "files" ? (
@@ -437,24 +440,27 @@ function HostFilesView({ query, root, path, busy, showSensitive, uploadRef, onUp
   const parentPath = currentParts.length <= 1 ? "/" : `/${currentParts.slice(0, -1).join("/")}`;
   const atFileSystemRoot = currentAbsolutePath === "/";
   const startLabel = root === "system" ? "系统（起始）" : root === "workspace" ? "工作区（起始）" : root === "build" ? "构件（起始）" : "私有（起始）";
+  const breadcrumbsRef = useRef<HTMLDivElement>(null);
+  // The breadcrumb trail is one scrollable line; keep the current folder in view.
+  useEffect(() => { breadcrumbsRef.current?.scrollTo({ left: breadcrumbsRef.current.scrollWidth }); }, [currentAbsolutePath]);
   return <div className="host-files">
     <div className="file-hero host-hero">
-      <div className="breadcrumbs" aria-label="当前位置">
-        {(data?.breadcrumbs ?? [{ name: startLabel, path: "" }]).map((crumb, index, array) => <span key={`${crumb.path}-${index}`}><button onClick={() => onNavigate(crumb.path)} aria-current={index === array.length - 1 ? "page" : undefined}>{crumb.name}</button>{index < array.length - 1 && <Glyph name="chevron" size={13} />}</span>)}
+      <div className="breadcrumbs" ref={breadcrumbsRef} aria-label="当前位置">
+        {(data?.breadcrumbs ?? [{ name: startLabel, path: "" }]).map((crumb, index, array) => <span key={`${crumb.path}-${index}`}><button onClick={() => onNavigate(crumb.path)} title={crumb.path || crumb.name} aria-current={index === array.length - 1 ? "page" : undefined}>{crumb.name}</button>{index < array.length - 1 && <Glyph name="chevron" size={13} />}</span>)}
       </div>
       <div className="workspace-title"><strong>{data?.locationLabel ?? "正在读取"}</strong><span className={data?.writable ? "permission writable" : "permission readonly"}>{data?.writable ? "目录可写" : "目录只读"}</span></div>
       <div className="absolute-path" aria-label="当前目录绝对路径"><span>磁盘位置</span><code>{data?.absolutePath || "正在解析…"}</code></div>
       <div className="host-tools">
-        <ActionButton onClick={() => onNavigate(parentPath)} disabled={atFileSystemRoot || !currentAbsolutePath}>上一级</ActionButton>
-        <ActionButton onClick={() => void query.refetch()}><Glyph name="refresh" />刷新</ActionButton>
-        <ActionButton tone="accent" onClick={() => onDialog({ type: "file" })} disabled={busy || !data?.writable}><Glyph name="plus" />新建文件</ActionButton>
-        <ActionButton onClick={() => onDialog({ type: "folder" })} disabled={busy || !data?.writable}><Glyph name="folder" />新建目录</ActionButton>
-        <ActionButton onClick={() => uploadRef.current?.click()} disabled={busy || !data?.writable}><Glyph name="upload" />上传</ActionButton>
+        <ActionButton ariaLabel="上一级" onClick={() => onNavigate(parentPath)} disabled={atFileSystemRoot || !currentAbsolutePath}><Glyph name="previous" /><span>上一级</span></ActionButton>
+        <ActionButton ariaLabel="刷新" onClick={() => void query.refetch()}><Glyph name="refresh" /><span>刷新</span></ActionButton>
+        <ActionButton ariaLabel="新建文件" tone="accent" onClick={() => onDialog({ type: "file" })} disabled={busy || !data?.writable}><Glyph name="plus" /><span>新建文件</span></ActionButton>
+        <ActionButton ariaLabel="新建目录" onClick={() => onDialog({ type: "folder" })} disabled={busy || !data?.writable}><Glyph name="folder" /><span>新建目录</span></ActionButton>
+        <ActionButton ariaLabel="上传" onClick={() => uploadRef.current?.click()} disabled={busy || !data?.writable}><Glyph name="upload" /><span>上传</span></ActionButton>
         <input ref={uploadRef} className="sr-only" type="file" onChange={onUpload} aria-label="上传文件到当前系统目录" />
       </div>
     </div>
-    <div className={`sensitive-toggle ${showSensitive ? "enabled" : ""}`}><div><strong>显示敏感文件</strong><small>{showSensitive ? "已显示 .env、密钥目录等全部项目" : "默认隐藏 .env、*secret*、.ssh 等名称"}</small></div><button role="switch" aria-checked={showSensitive} aria-label="显示敏感文件" onClick={() => onSensitiveChange(!showSensitive)}><span /></button></div>
-    <div className="scope-note">运行身份：{data?.userIdentity ?? "读取中"}。这里的创建、保存、移动、重命名和删除都直接作用于上方显示的磁盘目录。</div>
+    <div className={`sensitive-toggle ${showSensitive ? "enabled" : ""}`}><div><strong>显示敏感文件</strong><small>{showSensitive ? "已显示 .env、密钥目录等全部项目" : "默认隐藏 .env、*secret*、.ssh 等名称"}</small></div><button role="switch" aria-checked={showSensitive} aria-label="显示敏感文件" onClick={() => onSensitiveChange(!showSensitive)}><span className="switch-track"><span /></span></button></div>
+    <div className="scope-note"><strong>运行身份：{data?.userIdentity ?? "读取中"}</strong><span>这里的创建、保存、移动、重命名和删除都直接作用于当前磁盘目录。</span></div>
     <div className="file-list" role="list" aria-busy={query.isPending}>
       {query.isPending && <div className="empty-state"><div className="loader" /><p>正在读取目录</p></div>}
       {(query.isError || data?.ok === false) && <div className="empty-state error"><strong>目录无法读取</strong><p>{data?.message ?? query.error?.message ?? "运行环境没有返回目录内容。"}</p><button onClick={() => void query.refetch()}>重新加载</button></div>}
@@ -465,7 +471,7 @@ function HostFilesView({ query, root, path, busy, showSensitive, uploadRef, onUp
         const followable = opensFolder || opensFile;
         const detail = item.kind === "link" ? `符号链接 → ${item.targetKind === "folder" ? "文件夹" : item.targetKind === "file" ? "文件" : item.targetKind === "broken" ? "目标失效" : "目标不可用"}` : item.kind === "folder" ? "文件夹" : `${formatBytes(item.size)} · ${item.writable ? "可写" : "只读"}`;
         return <article key={item.path} role="listitem" className="file-row">
-          <button className="file-main" onClick={() => opensFolder ? onNavigate(item.path) : opensFile ? onOpen(item) : undefined} disabled={!followable} aria-label={`${opensFolder ? "打开文件夹" : opensFile ? "预览文件" : "不可跟随"} ${item.name}`}>
+          <button className="file-main" title={item.name} onClick={() => opensFolder ? onNavigate(item.path) : opensFile ? onOpen(item) : undefined} disabled={!followable} aria-label={`${opensFolder ? "打开文件夹" : opensFile ? "预览文件" : "不可跟随"} ${item.name}`}>
             <span className={`file-icon ${opensFolder ? "folder" : "file"}`}><Glyph name={opensFolder ? "folder" : "file"} size={21} /></span>
             <span className="file-meta"><strong>{item.name}</strong><small>{detail}</small></span>{opensFolder && <Glyph name="chevron" size={16} />}
           </button>
@@ -499,7 +505,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
   const [agentToken, setAgentToken] = useState<string | null>(null);
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
   const [aiConfigOpen, setAiConfigOpen] = useState(false);
-  const [agentExpanded, setAgentExpanded] = useState(false);
+  const [agentExpanded, setAgentExpanded] = useState(() => window.matchMedia("(min-width: 720px)").matches);
   const [agentContextLoaded, setAgentContextLoaded] = useState(false);
   const agentStepCountRef = useRef(0);
   const outputRef = useRef<HTMLDivElement>(null);
@@ -601,13 +607,13 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
     }
     await runAgent({ confirmToken: token });
   }
-  return <section className="terminal-panel" aria-label="终端">
-    <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 25 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
+  return <section className={`terminal-panel ${agentExpanded ? "ai-open" : "ai-closed"}`} aria-label="终端">
+    <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 {SHELL_TIMEOUT_SECONDS} 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
     <div className={`terminal-location ${locationOpen ? "is-open" : "is-collapsed"}`}><button type="button" className="terminal-location-toggle" onClick={() => setLocationOpen((open) => !open)} aria-expanded={locationOpen}>执行位置 <span>{root === "workspace" ? "工作区" : root} · {path || "根目录"}</span><b>{locationOpen ? "收起" : "展开"}</b></button><div className="terminal-location-fields"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div></div>
-    <div id="ai-agent-panel" className={`ai-terminal-panel ${agentExpanded ? "is-expanded" : "is-collapsed"}`}>
+    <div id="ai-agent-panel" className="ai-terminal-panel">
       <div className="ai-terminal-heading">
         <div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div>
-        <div className="ai-terminal-heading-actions"><span>自动读取输出并继续 · 改删操作确认</span><button type="button" className="ai-panel-toggle" onClick={() => setAgentExpanded((expanded) => !expanded)} aria-expanded={agentExpanded} aria-controls="ai-agent-panel">{agentExpanded ? "收起对话" : "展开对话"}</button><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>{aiConfigOpen ? "收起配置" : "模型配置"}</button></div>
+        <div className="ai-terminal-heading-actions"><span>自动读取输出并继续 · 改删操作确认</span><button type="button" className="ai-panel-toggle" onClick={() => setAgentExpanded(false)} aria-expanded={true} aria-controls="ai-agent-panel">收起对话</button><button type="button" className="ai-context-clear" onClick={() => void clearAgentContext()} disabled={aiBusy || !agentMessages.length}>清除上下文</button><button type="button" className="ai-config-toggle" onClick={() => setAiConfigOpen((open) => !open)} aria-expanded={aiConfigOpen}>{aiConfigOpen ? "收起配置" : "模型配置"}</button></div>
       </div>
       {aiConfigOpen && <div className="ai-terminal-config"><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="API 地址，例如 https://api.openai.com" /><input type="password" autoComplete="off" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={aiKeyHint ? `API Key 已保存（${aiKeyHint}），留空则不变` : "API Key"} /><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}><option value="">选择模型</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select><button type="button" onClick={() => void pullModels()} disabled={aiBusy || !aiKeyAvailable}>拉取模型</button><button type="button" onClick={() => void saveAi()} disabled={aiBusy || !aiKeyAvailable || !aiModel.trim()}>保存配置</button></div>}
       <div className="agent-chat" ref={chatRef} role="log" aria-live="polite">
@@ -615,7 +621,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
         {agentMessages.map((message, index) => <div className={`agent-message ${message.role}`} key={index}>
           <div className="agent-message-role">{message.role === "user" ? "你" : "AI"}</div>
           {message.text && <div className="agent-message-text">{message.text}</div>}
-          {message.steps && message.steps.length > 0 && <div className="agent-message-steps agent-message-steps-compact">{message.steps.map((step, stepIndex) => <div key={`${step.command}-${stepIndex}`}><span>{step.exitCode === 0 ? "命令执行成功" : `命令执行完成 · 退出 ${step.exitCode ?? "未知"}`}</span></div>)}</div>}
+          {message.steps && message.steps.length > 0 && <div className="agent-message-steps">{message.steps.map((step, stepIndex) => <div key={`${step.command}-${stepIndex}`}><span>{step.exitCode === 0 ? "命令执行成功" : `命令执行完成 · 退出 ${step.exitCode ?? "未知"}`}</span></div>)}</div>}
           {message.diagnostic && <div className="agent-diagnostic">
             <div className="agent-diagnostic-row"><span>阶段</span><code>{message.diagnostic.phase}</code></div>
             <div className="agent-diagnostic-row"><span>地址</span><code>{message.diagnostic.url}</code></div>
@@ -629,8 +635,8 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
         </div>)}
         {aiBusy && <div className="agent-message assistant pending"><div className="agent-message-role">AI</div><div className="agent-message-text">正在思考并执行下一步…</div></div>}
       </div>
-      {agentPending && <div className="ai-command-preview"><code>{agentPending}</code><button type="button" onClick={() => void confirmPending()} disabled={aiBusy}>确认并执行</button><button type="button" className="ai-command-reject" onClick={() => void runAgent({ reject: true })} disabled={aiBusy}>拒绝</button></div>}
-      <form className="ai-terminal-prompt" onSubmit={(event) => { event.preventDefault(); void runAgent(); }}><input value={agentPrompt} onChange={(event) => setAgentPrompt(event.target.value)} placeholder={agentPending ? "输入修改意见会替代待确认命令" : agentTaskId ? "继续补充要求，或直接发送继续" : "描述一个完整任务，例如：检查项目错误并修复，然后运行测试"} /><button type="submit" disabled={aiBusy || (!agentPrompt.trim() && !agentTaskId)}>{aiBusy ? "执行中" : agentTaskId ? "继续" : "发送"}</button></form>
+      {agentPending && <div className="ai-command-preview"><code>{agentPending}</code><button type="button" onClick={() => void confirmPending()} disabled={aiBusy}>确认并执行</button><button type="button" className="ai-secondary" onClick={() => void runAgent({ reject: true })} disabled={aiBusy}>拒绝</button></div>}
+      <form className="ai-terminal-prompt" onSubmit={(event) => { event.preventDefault(); void runAgent(); }}><input value={agentPrompt} onChange={(event) => setAgentPrompt(event.target.value)} placeholder={agentPending ? "输入修改意见会替代待确认命令" : agentTaskId ? "继续补充要求，或直接发送继续" : "描述一个完整任务，例如：检查项目错误并修复，然后运行测试"} /><button type="submit" className={agentPending ? "ai-secondary" : undefined} disabled={aiBusy || (!agentPrompt.trim() && !agentTaskId)}>{aiBusy ? "执行中" : agentTaskId ? "继续" : "发送"}</button></form>
     </div>
     <div className="terminal-output" ref={outputRef} role="log" aria-live="polite">
       {!entries.length && <div className="terminal-empty">在下方输入命令。命令以当前运行用户身份执行，输出最多保留 1 MB。</div>}
@@ -676,7 +682,6 @@ function MonitorView({ snapshot, history, loading, error, onRefresh, directoryUs
   const networkTicks = networkHasTraffic ? [0, networkAxisMax / 2, networkAxisMax] : [0];
   const inactiveLoopDevices = snapshot.disks.filter((disk) => disk.name.startsWith("loop") && disk.readPerSec === 0 && disk.writePerSec === 0);
   const visibleDisks = snapshot.disks.filter((disk) => !inactiveLoopDevices.includes(disk));
-  const coreColors = ["var(--accent)", "var(--amber)", "#2f7da5", "#b44d80"];
   return <section className="monitor-panel" aria-label="系统监控">
     <div className="monitor-hero">
       <div className="pulse-block"><span>CPU 即时占用 · 1 秒采样</span><strong>{snapshot.cpuPercent.toFixed(1)}<small>%</small></strong><div className="pulse-meta"><span>{snapshot.hostname}</span><span>{snapshot.platform}</span></div></div>
@@ -700,8 +705,8 @@ function MonitorView({ snapshot, history, loading, error, onRefresh, directoryUs
 
     <div className="monitor-grid">
       <div className="chart-panel resource-chart">
-        <div className="panel-heading"><div><span>处理器曲线</span><strong>总占用与每核心</strong></div><div className="legend cpu-legend"><span className="cpu">总计</span>{snapshot.cpuCores.map((core) => <span key={core.name}>{core.name.replace("cpu", "核心 ")}</span>)}</div></div>
-        <div className="chart-frame" role="img" aria-label="最近 60 秒 CPU 总占用和每核心占用折线图"><ResponsiveContainer width="100%" height="100%"><LineChart data={history} margin={{ top: 8, right: 4, bottom: 0, left: -24 }}><CartesianGrid stroke="var(--grid)" vertical={false} /><XAxis dataKey="time" tickFormatter={formatTime} minTickGap={38} tick={{ fill: "var(--dim)", fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis domain={[0, 100]} ticks={[0, 50, 100]} tickFormatter={(value) => `${value}%`} tick={{ fill: "var(--dim)", fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: "var(--surface-strong)", border: "1px solid var(--border)", borderRadius: 8, color: "var(--text)" }} labelFormatter={(label) => formatTime(String(label))} /><Line type="monotone" dataKey="cpu" name="CPU 总计" stroke="var(--text)" strokeWidth={2.5} dot={false} isAnimationActive={false} />{snapshot.cpuCores.map((core, index) => <Line key={core.name} type="monotone" dataKey={`core-${core.name}`} name={core.name.replace("cpu", "核心 ")} stroke={coreColors[index % coreColors.length]} strokeWidth={1.8} dot={false} isAnimationActive={false} />)}</LineChart></ResponsiveContainer></div>
+        <div className="panel-heading"><div><span>处理器曲线</span><strong>总占用与每核心</strong></div><div className="legend cpu-legend"><span style={{ color: "var(--text)" }}>总计</span>{snapshot.cpuCores.map((core, index) => <span key={core.name} style={{ color: CORE_COLORS[index % CORE_COLORS.length] }}>{core.name.replace("cpu", "核心 ")}</span>)}</div></div>
+        <div className="chart-frame" role="img" aria-label="最近 60 秒 CPU 总占用和每核心占用折线图"><ResponsiveContainer width="100%" height="100%"><LineChart data={history} margin={{ top: 8, right: 4, bottom: 0, left: -16 }}><CartesianGrid stroke="var(--grid)" vertical={false} /><XAxis dataKey="time" tickFormatter={formatTime} minTickGap={38} tick={{ fill: "var(--dim)", fontSize: 11 }} axisLine={false} tickLine={false} /><YAxis domain={[0, 100]} ticks={[0, 50, 100]} tickFormatter={(value) => `${value}%`} tick={{ fill: "var(--dim)", fontSize: 11 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: "var(--surface-strong)", border: "1px solid var(--border)", borderRadius: 8, color: "var(--text)" }} labelFormatter={(label) => formatTime(String(label))} /><Line type="monotone" dataKey="cpu" name="CPU 总计" stroke="var(--text)" strokeWidth={2.5} dot={false} isAnimationActive={false} />{snapshot.cpuCores.map((core, index) => <Line key={core.name} type="monotone" dataKey={`core-${core.name}`} name={core.name.replace("cpu", "核心 ")} stroke={CORE_COLORS[index % CORE_COLORS.length]} strokeWidth={1.8} dot={false} isAnimationActive={false} />)}</LineChart></ResponsiveContainer></div>
       </div>
 
       <section className="stats-panel" aria-label="内存与平均负载">
@@ -712,13 +717,13 @@ function MonitorView({ snapshot, history, loading, error, onRefresh, directoryUs
 
       <section className="mount-panel wide-panel" aria-labelledby="mount-heading">
         <div className="panel-heading"><div><span>文件系统</span><strong id="mount-heading">挂载点容量</strong></div><small>与 df 口径一致</small></div>
-        <div className="mount-list">{snapshot.mounts.map((mount) => <div className="mount-row" key={mount.path}><div className="mount-name"><strong>{mount.path}</strong><span>{mount.percent.toFixed(1)}%</span></div><div className="bar-track"><span className={mount.percent >= 85 ? "amber" : ""} style={{ width: `${mount.percent}%` }} /></div><dl><div><dt>总量</dt><dd>{formatBytes(mount.total)}</dd></div><div><dt>已用</dt><dd>{formatBytes(mount.used)}</dd></div><div><dt>可用</dt><dd>{formatBytes(mount.available)}</dd></div></dl></div>)}</div>
+        <div className="mount-list">{snapshot.mounts.map((mount) => <div className="mount-row" key={mount.path}><div className="mount-name"><strong title={mount.path}>{mount.path}</strong><span>{mount.percent.toFixed(1)}%</span></div><div className="bar-track"><span className={mount.percent >= 85 ? "amber" : ""} style={{ width: `${mount.percent}%` }} /></div><dl><div><dt>总量</dt><dd>{formatBytes(mount.total)}</dd></div><div><dt>已用</dt><dd>{formatBytes(mount.used)}</dd></div><div><dt>可用</dt><dd>{formatBytes(mount.available)}</dd></div></dl></div>)}</div>
       </section>
 
       <div className="chart-panel network-chart">
         <div className="panel-heading"><div><span>网络吞吐</span><strong>按网卡拆分</strong></div><div className="network-now"><span>↓ {formatBytes(snapshot.network.rxPerSec)}/s</span><span>↑ {formatBytes(snapshot.network.txPerSec)}/s</span></div></div>
         <div className="interface-list">{snapshot.network.interfaces.length ? snapshot.network.interfaces.map((iface) => <div key={iface.name}><strong>{iface.name}</strong><span>↓ {formatBytes(iface.rxPerSec)}/s</span><span>↑ {formatBytes(iface.txPerSec)}/s</span></div>) : <div className="interface-empty">未发现可用网卡</div>}</div>
-        {networkHasTraffic ? <div className="chart-frame compact network-plot" role="img" aria-label="最近 60 秒非回环网卡总接收和发送速率面积图"><ResponsiveContainer width="100%" height="100%"><AreaChart data={history} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}><CartesianGrid stroke="var(--grid)" vertical={false} /><XAxis dataKey="time" tickFormatter={formatTime} minTickGap={38} tick={{ fill: "var(--dim)", fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis width={48} domain={[0, networkAxisMax]} ticks={networkTicks} tickFormatter={formatBytes} tick={{ fill: "var(--dim)", fontSize: 10 }} axisLine={false} tickLine={false} allowDataOverflow /><Tooltip formatter={(value) => `${formatBytes(Number(value))}/s`} labelFormatter={(label) => formatTime(String(label))} contentStyle={{ background: "var(--surface-strong)", border: "1px solid var(--border)", borderRadius: 8, color: "var(--text)" }} /><Area type="monotone" dataKey="rx" name="接收" stroke="var(--accent)" fill="var(--accent-soft)" strokeWidth={2} isAnimationActive={false} /><Area type="monotone" dataKey="tx" name="发送" stroke="var(--amber)" fill="transparent" strokeWidth={1.7} isAnimationActive={false} /></AreaChart></ResponsiveContainer></div> : <div className="network-empty" role="status" aria-label="当前采样窗口没有检测到网络流量"><strong>暂无网络流量</strong><small>当前采样窗口的收发速率均为 0 B/s</small></div>}
+        {networkHasTraffic ? <div className="chart-frame compact network-plot" role="img" aria-label="最近 60 秒非回环网卡总接收和发送速率面积图"><ResponsiveContainer width="100%" height="100%"><AreaChart data={history} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}><CartesianGrid stroke="var(--grid)" vertical={false} /><XAxis dataKey="time" tickFormatter={formatTime} minTickGap={38} tick={{ fill: "var(--dim)", fontSize: 11 }} axisLine={false} tickLine={false} /><YAxis width={48} domain={[0, networkAxisMax]} ticks={networkTicks} tickFormatter={formatBytes} tick={{ fill: "var(--dim)", fontSize: 11 }} axisLine={false} tickLine={false} allowDataOverflow /><Tooltip formatter={(value) => `${formatBytes(Number(value))}/s`} labelFormatter={(label) => formatTime(String(label))} contentStyle={{ background: "var(--surface-strong)", border: "1px solid var(--border)", borderRadius: 8, color: "var(--text)" }} /><Area type="monotone" dataKey="rx" name="接收" stroke="var(--accent)" fill="var(--accent-soft)" strokeWidth={2} isAnimationActive={false} /><Area type="monotone" dataKey="tx" name="发送" stroke="var(--amber)" fill="transparent" strokeWidth={1.7} isAnimationActive={false} /></AreaChart></ResponsiveContainer></div> : <div className="network-empty" role="status" aria-label="当前采样窗口没有检测到网络流量"><strong>暂无网络流量</strong><small>当前采样窗口的收发速率均为 0 B/s</small></div>}
       </div>
 
       <section className="io-panel" aria-labelledby="disk-io-heading">
@@ -748,6 +753,9 @@ function ImageViewer({ viewer, busy, onClose, onNavigate, onDownload }: { viewer
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
   const [imageError, setImageError] = useState(false);
   const dragRef = useRef<{ x: number; y: number; originX: number; originY: number } | null>(null);
+  const pointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchRef = useRef<{ distance: number; zoom: number } | null>(null);
+  const tapRef = useRef({ time: 0, moved: false });
   const index = viewer.images.findIndex((item) => item.path === viewer.item.path);
   const previous = index > 0 ? viewer.images[index - 1] : undefined;
   const next = index >= 0 && index < viewer.images.length - 1 ? viewer.images[index + 1] : undefined;
@@ -770,11 +778,55 @@ function ImageViewer({ viewer, busy, onClose, onNavigate, onDownload }: { viewer
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [next, onClose, onNavigate, previous]);
 
-  function changeZoom(delta: number) {
-    setZoom((current) => Math.min(8, Math.max(0.15, Number((current + delta).toFixed(2)))));
-  }
+  function clampZoom(value: number) { return Math.min(8, Math.max(0.15, Number(value.toFixed(2)))); }
+  function changeZoom(delta: number) { setZoom((current) => clampZoom(current + delta)); }
   function fitWindow() { setFit(true); setZoom(1); setPan({ x: 0, y: 0 }); }
   function actualSize() { setFit(false); setZoom(1); setPan({ x: 0, y: 0 }); }
+  function pointerDistance() {
+    const [a, b] = [...pointersRef.current.values()];
+    return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
+  }
+  function onStagePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (unavailable || event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (pointersRef.current.size === 2) {
+      // Two fingers: pinch zoom from the current scale instead of panning.
+      pinchRef.current = { distance: pointerDistance(), zoom };
+      dragRef.current = null;
+      tapRef.current.moved = true;
+    } else if (pointersRef.current.size === 1) {
+      dragRef.current = { x: event.clientX, y: event.clientY, originX: pan.x, originY: pan.y };
+      tapRef.current.moved = false;
+    }
+  }
+  function onStagePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (!pointersRef.current.has(event.pointerId)) return;
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const pinch = pinchRef.current;
+    if (pinch) {
+      const distance = pointerDistance();
+      if (distance > 0 && pinch.distance > 0) setZoom(clampZoom(pinch.zoom * distance / pinch.distance));
+      return;
+    }
+    const drag = dragRef.current;
+    if (!drag) return;
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 6) tapRef.current.moved = true;
+    setPan({ x: drag.originX + dx, y: drag.originY + dy });
+  }
+  function onStagePointerEnd(event: React.PointerEvent<HTMLDivElement>) {
+    if (!pointersRef.current.delete(event.pointerId)) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    dragRef.current = null;
+    if (pinchRef.current) { if (pointersRef.current.size < 2) pinchRef.current = null; return; }
+    if (event.type !== "pointerup" || tapRef.current.moved) return;
+    // Double tap (or double click) toggles between fit-to-window and 1:1.
+    const now = event.timeStamp;
+    if (now - tapRef.current.time < 320) { tapRef.current.time = 0; if (fit) actualSize(); else fitWindow(); }
+    else tapRef.current.time = now;
+  }
 
   const unavailable = !viewer.loading && (!viewer.dataUri || imageError);
   return <div className="image-viewer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -790,7 +842,7 @@ function ImageViewer({ viewer, busy, onClose, onNavigate, onDownload }: { viewer
           <button onClick={onClose} aria-label="关闭图片查看器"><Glyph name="close" /></button>
         </div>
       </header>
-      <div className="image-stage" onWheel={(event) => { if (unavailable) return; event.preventDefault(); changeZoom(event.deltaY > 0 ? -0.15 : 0.15); }} onPointerMove={(event) => { const drag = dragRef.current; if (!drag) return; setPan({ x: drag.originX + event.clientX - drag.x, y: drag.originY + event.clientY - drag.y }); }} onPointerUp={(event) => { dragRef.current = null; event.currentTarget.releasePointerCapture(event.pointerId); }} onPointerCancel={() => { dragRef.current = null; }} onPointerDown={(event) => { if (unavailable || event.button !== 0 || (event.target as HTMLElement).closest("button")) return; dragRef.current = { x: event.clientX, y: event.clientY, originX: pan.x, originY: pan.y }; event.currentTarget.setPointerCapture(event.pointerId); }}>
+      <div className="image-stage" onWheel={(event) => { if (unavailable) return; event.preventDefault(); changeZoom(event.deltaY > 0 ? -0.15 : 0.15); }} onPointerDown={onStagePointerDown} onPointerMove={onStagePointerMove} onPointerUp={onStagePointerEnd} onPointerCancel={onStagePointerEnd}>
         {previous && <button className="image-nav previous" onClick={(event) => { event.stopPropagation(); onNavigate(previous); }} aria-label={`上一张：${previous.name}`}><Glyph name="previous" size={26} /></button>}
         {next && <button className="image-nav next" onClick={(event) => { event.stopPropagation(); onNavigate(next); }} aria-label={`下一张：${next.name}`}><Glyph name="next" size={26} /></button>}
         {viewer.loading ? <div className="image-viewer-status" role="status"><div className="loader" /><strong>正在载入图片</strong></div> : unavailable ? <div className="image-viewer-status error" role="status"><Glyph name="file" size={42} /><strong>{viewer.tooLarge ? "文件过大，建议下载" : "图片无法显示"}</strong><p>{viewer.message || "图片可能已损坏或格式不受支持。"}</p><button onClick={() => onDownload(viewer.item)} disabled={busy}><Glyph name="download" />{busy ? "准备中…" : "下载文件"}</button></div> : <img src={viewer.dataUri ?? undefined} alt={`图片预览：${viewer.item.name}`} draggable={false} className={fit ? "fit" : "actual"} style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }} onLoad={(event) => setDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} onError={() => setImageError(true)} />}

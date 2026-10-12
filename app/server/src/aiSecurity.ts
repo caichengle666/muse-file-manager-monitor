@@ -11,7 +11,7 @@ import { lookup } from "node:dns/promises";
 export const AI_REQUEST_TIMEOUT_MS = 60_000;
 // Agent steps run inside one platform action call. Keep each call below the
 // gateway limit while still allowing slow models enough time to answer.
-export const AI_AGENT_REQUEST_TIMEOUT_MS = 100_000;
+export const AI_AGENT_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
  * Structured failure details for the AI terminal. The UI shows these verbatim so a
@@ -101,12 +101,19 @@ export function normalizeAiBaseUrl(value: string): string | null {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
     if (parsed.username || parsed.password) return null;
     if (isPrivateHostname(parsed.hostname)) return null;
+    // A bare host gets the usual /v1; any explicit path (/v1beta/openai, /api/v3,
+    // /v1/openai…) is the provider's own and is kept as typed.
     const pathname = parsed.pathname.replace(/\/+$/, "");
-    parsed.pathname = pathname.endsWith("/v1") ? pathname : `${pathname}/v1`;
+    parsed.pathname = pathname || "/v1";
     parsed.search = "";
     parsed.hash = "";
     return parsed.toString().replace(/\/+$/, "");
   } catch { return null; }
+}
+
+// A saved API key is only ever sent back to the origin it was saved for.
+export function sameAiOrigin(savedBaseUrl: string, baseUrl: string): boolean {
+  try { return new URL(savedBaseUrl).origin === new URL(baseUrl).origin; } catch { return false; }
 }
 
 export function requirePublicBaseUrl(value: string): string {

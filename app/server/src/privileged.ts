@@ -1,5 +1,6 @@
 import {
   accessSync,
+  chmodSync,
   chownSync,
   closeSync,
   constants,
@@ -22,7 +23,8 @@ import { execFile, spawn } from "node:child_process";
 import { cpus, homedir, hostname, loadavg, platform, release, uptime, userInfo } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { definePrivilegedContracts, definePrivilegedHandlers, z } from "@hatch/space-sdk";
-import { SHELL_TIMEOUT_MS, selectShellExecutionMode, shellSpawnArgs } from "./shellExecution";
+import { SHELL_COMMAND_MAX_CHARS, SHELL_OUTPUT_MAX_CHARS, SHELL_TIMEOUT_MS, createOutputCollector, selectShellExecutionMode, shellSpawnArgs } from "./shellExecution";
+import { isUtf8Text, pathExists, selectListing, utf8SafeLength } from "./hostFiles";
 
 export const privileged = definePrivilegedContracts({
   listHostDirectory: {
@@ -92,12 +94,14 @@ export const privileged = definePrivilegedContracts({
     timeoutMs: 5000,
   },
   materializePrivateWorkspace: {
-    request: z.object({ entries: z.array(z.object({ path: z.string().max(2000), kind: z.enum(["folder", "file"]), dataBase64: z.string().max(8_000_000).nullable() })).max(1000) }),
-    response: z.object({ ok: z.boolean(), message: z.string(), migrated: z.boolean(), path: z.string() }),
+    // Called in batches; only the final batch marks the migration done. An empty
+    // non-final call just reports whether it is done.
+    request: z.object({ entries: z.array(z.object({ path: z.string().max(2000), kind: z.enum(["folder", "file"]), dataBase64: z.string().max(16_000_000).nullable() })).max(1000), final: z.boolean() }),
+    response: z.object({ ok: z.boolean(), message: z.string(), migrated: z.boolean(), done: z.boolean(), path: z.string() }),
     timeoutMs: 15000,
   },
   executeShell: {
-    request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null), runAsRoot: z.boolean().default(false) }),
+    request: z.object({ command: z.string().min(1).max(SHELL_COMMAND_MAX_CHARS), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null), runAsRoot: z.boolean().default(false) }),
     response: z.object({ ok: z.boolean(), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), timedOut: z.boolean(), cwd: z.string(), durationMs: z.number().int() }),
     timeoutMs: 30000,
   },
@@ -439,7 +443,17 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       if (!statSync(target.absolute).isDirectory()) return { ...empty, message: "这个位置不是文件夹。" };
       const dirents = readdirSync(target.absolute, { withFileTypes: true });
       const filtered = dirents.filter((entry) => args.showSensitive || !blockedNames.test(entry.name));
-      const visible = filtered.slice(0, 500);
+      const rankOf = (entry: (typeof dirents)[number]): number => {
+        if (entry.isDirectory()) return 0;
+        if (!entry.isSymbolicLink()) return entry.isFile() ? 1 : 2;
+        try {
+          const resolved = realpathSync(join(target.absolute, entry.name));
+          if (!args.showSensitive && resolved.split("/").filter(Boolean).some((part) => blockedNames.test(part))) return 2;
+          const targetStats = statSync(resolved);
+          return targetStats.isDirectory() ? 0 : targetStats.isFile() ? 1 : 2;
+        } catch { return 2; }
+      };
+      const visible = selectListing(filtered.map((entry) => ({ name: entry.name, rank: rankOf(entry), entry })), 500).map((item) => item.entry);
       const entries = visible.map((entry) => {
         const lexical = join(target.absolute, entry.name);
         let size = 0; let modifiedAt = new Date(0).toISOString(); let writable = false;
@@ -466,9 +480,6 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         } catch { /* disappeared */ }
         const path = join(target.absolute, entry.name);
         return { name: entry.name, path, kind: entry.isDirectory() ? "folder" as const : entry.isSymbolicLink() ? "link" as const : "file" as const, targetKind, size, modifiedAt, writable, removable: canWrite(target.absolute) };
-      }).sort((a, b) => {
-        const rank = (entry: typeof a) => entry.kind === "folder" || entry.targetKind === "folder" ? 0 : entry.kind === "file" || entry.targetKind === "file" ? 1 : 2;
-        return rank(a) - rank(b) || a.name.localeCompare(b.name, "zh-CN", { numeric: true });
       });
       return { ok: true, message: `${entries.length} 个项目`, root: args.root, path: target.absolute, absolutePath: target.absolute, locationLabel: selectedRoot.label, entries, breadcrumbs: breadcrumbsFor(target.absolute, startName), truncated: filtered.length > visible.length, writable: canWrite(target.absolute), userIdentity: identity() };
     } catch { return { ...empty, path: target.absolute, absolutePath: target.absolute, breadcrumbs: breadcrumbsFor(target.absolute, startName), message: "目录无法读取，可能已移动或权限不足。" }; }
@@ -521,7 +532,11 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       if (!stats.isFile()) return { ...denied, message: "只能预览文件。" };
       const first = readSlice(target.absolute, 0, Math.min(64_000, Math.max(1, stats.size)));
       const text = isLikelyText(first, target.absolute);
-      const bytes = readSlice(target.absolute, Math.min(args.offset, stats.size), args.limit);
+      const start = Math.min(args.offset, stats.size);
+      const slice = readSlice(target.absolute, start, args.limit);
+      const whole = start === 0 && slice.byteLength >= stats.size;
+      // A page that stops before the end of the file ends on a character boundary.
+      const bytes = text && start + slice.byteLength < stats.size ? slice.subarray(0, utf8SafeLength(slice) || slice.byteLength) : slice;
       const nextOffset = Math.min(stats.size, args.offset + bytes.byteLength);
       const writable = canWrite(target.absolute);
       return {
@@ -530,7 +545,8 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         name: basename(target.absolute), mode: text ? "text" as const : "hex" as const,
         content: text ? new TextDecoder("utf-8", { fatal: false }).decode(bytes) : toHex(bytes, args.offset),
         offset: args.offset, nextOffset, totalSize: stats.size, eof: nextOffset >= stats.size,
-        editable: text && stats.size <= 8_000_000 && writable, writable,
+        // Only a file read whole that is entirely UTF-8 can be saved back unchanged.
+        editable: text && whole && stats.size <= 8_000_000 && writable && isUtf8Text(bytes), writable,
       };
     } catch { return { ...denied, message: "文件无法读取，可能已移动或权限不足。" }; }
   },
@@ -583,17 +599,25 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       assertSafeMutationTarget(target.absolute);
       const first = readSlice(target.absolute, 0, Math.min(64_000, Math.max(1, stats.size)));
       if (!isLikelyText(first, target.absolute)) return { ok: false, message: "二进制文件只能查看十六进制或下载，不能按文本保存。" };
+      if (stats.size > 8_000_000 || !isUtf8Text(readFileSync(target.absolute))) return { ok: false, message: "文件不是 UTF-8 编码（或过大），按文本保存会损坏原内容，未作任何更改。" };
       if (!canWrite(target.absolute)) return { ok: false, message: "当前运行用户没有这个文件的写入权限。" };
       const parentDirectory = assertSafeParent(target.absolute);
       if (!canWrite(parentDirectory)) return { ok: false, message: "为保护原文件，保存需要其所在目录可写；当前目录只读，未作任何更改。" };
-      if (stats.nlink > 1) {
-        // Replacing via rename would split the hard link; write in place instead.
+      const uid = process.getuid?.();
+      // Replacing via rename would split a hard link, or hand a file owned by
+      // someone else to the worker (only root can chown it back); write in place.
+      const inPlace = stats.nlink > 1 ? "文件有多个硬链接，已原地保存以保留链接。" : uid !== undefined && uid !== 0 && stats.uid !== uid ? "文件属于其他用户，已原地保存以保留所有者。" : "";
+      if (inPlace) {
         writeFileSync(target.absolute, args.content, "utf8");
-        return { ok: true, message: "文件有多个硬链接，已原地保存以保留链接。" };
+        return { ok: true, message: inPlace };
       }
-      temporaryPath = join(parentDirectory, `.${basename(target.absolute)}.muse-${crypto.randomUUID()}.tmp`);
-      writeFileSync(temporaryPath, args.content, { encoding: "utf8", mode: stats.mode, flag: "wx" });
-      if (process.getuid?.() === 0) chownSync(temporaryPath, stats.uid, stats.gid);
+      // A fixed-length name: the original name plus a suffix can pass the 255-byte limit.
+      temporaryPath = join(parentDirectory, `.muse-${crypto.randomUUID()}.tmp`);
+      writeFileSync(temporaryPath, args.content, { encoding: "utf8", flag: "wx" });
+      if (uid === 0) chownSync(temporaryPath, stats.uid, stats.gid);
+      // After chown, which clears setuid/setgid; the umask must not narrow the mode
+      // either. Best effort: some filesystems do not support chmod.
+      try { chmodSync(temporaryPath, stats.mode & 0o7777); } catch { /* keep the default mode */ }
       renameSync(temporaryPath, target.absolute);
       temporaryPath = "";
       return { ok: true, message: "文件已原子保存，原内容已安全替换。" };
@@ -627,24 +651,24 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const selectedRoot = findRoot(args.root);
     if (!selectedRoot || !args.path) return { ok: false, message: "不能删除这个位置。" };
     const source = resolveMutationSource(selectedRoot.path, args.path, args.showSensitive);
-    if (!source || !existsSync(source.absolute)) return { ok: false, message: "项目不存在或路径无效。" };
-    const parent = dirname(source.absolute);
-    const quarantine = join(parent, `.${basename(source.absolute)}.muse-delete-${crypto.randomUUID()}`);
+    // A symlink (even a broken one) is deleted itself; rename and rm never follow it.
+    if (!source || !pathExists(source.absolute)) return { ok: false, message: "项目不存在或路径无效。" };
+    // A fixed-length name: the original name plus a suffix can pass the 255-byte limit.
+    const quarantine = join(dirname(source.absolute), `.muse-delete-${crypto.randomUUID()}`);
     let staged = false;
     try {
-      assertSafeMutationTarget(source.absolute);
       renameSync(source.absolute, quarantine);
       staged = true;
       rmSync(quarantine, { recursive: true, force: false });
-      if (existsSync(quarantine) || existsSync(source.absolute)) return { ok: false, message: "删除未完成：文件系统仍报告项目存在，请刷新后重试。" };
+      if (pathExists(quarantine) || pathExists(source.absolute)) return { ok: false, message: "删除未完成：文件系统仍报告项目存在，请刷新后重试。" };
       return { ok: true, message: "项目已从磁盘永久删除。" };
     } catch {
-      if (staged && existsSync(quarantine) && !existsSync(source.absolute)) {
+      if (staged && pathExists(quarantine) && !pathExists(source.absolute)) {
         try { renameSync(quarantine, source.absolute); } catch {
           return { ok: false, message: `删除过程中断，项目保留在同目录临时位置 ${basename(quarantine)}；请勿重复操作。` };
         }
       }
-      return { ok: false, message: existsSync(source.absolute) ? "删除失败，原项目仍在原位置；请检查上级目录权限。" : "删除状态异常，请刷新目录确认实际结果后再操作。" };
+      return { ok: false, message: pathExists(source.absolute) ? "删除失败，原项目仍在原位置；请检查上级目录权限。" : "删除状态异常，请刷新目录确认实际结果后再操作。" };
     }
   },
 
@@ -654,16 +678,16 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const name = validLeaf(args.newName, args.showSensitive);
     if (!selectedRoot || !targetDirectory || !name || !args.path) return { ok: false, message: "源路径、目标目录或名称无效。", path: null };
     const source = resolveMutationSource(selectedRoot.path, args.path, args.showSensitive);
-    if (!source || !existsSync(source.absolute)) return { ok: false, message: "源项目不存在。", path: null };
+    // A symlink is moved itself, like delete; a broken link at the destination still counts as taken.
+    if (!source || !pathExists(source.absolute)) return { ok: false, message: "源项目不存在。", path: null };
     const destination = join(targetDirectory.absolute, name);
-    if (existsSync(destination)) return { ok: false, message: "目标位置已有同名项目。", path: null };
+    if (pathExists(destination)) return { ok: false, message: "目标位置已有同名项目。", path: null };
     try {
-      assertSafeMutationTarget(source.absolute);
       renameSync(source.absolute, destination);
-      if (!existsSync(destination) || existsSync(source.absolute)) return { ok: false, message: "移动结果无法确认，请刷新源目录和目标目录后再操作。", path: null };
+      if (!pathExists(destination) || pathExists(source.absolute)) return { ok: false, message: "移动结果无法确认，请刷新源目录和目标目录后再操作。", path: null };
       return { ok: true, message: "项目已在磁盘上移动或重命名。", path: destination };
     } catch {
-      return { ok: false, message: existsSync(source.absolute) ? "移动失败，原项目仍在原位置；请检查权限、目标路径或是否跨文件系统。" : "移动状态异常，请刷新目录确认实际位置后再操作。", path: null };
+      return { ok: false, message: pathExists(source.absolute) ? "移动失败，原项目仍在原位置；请检查权限、目标路径或是否跨文件系统。" : "移动状态异常，请刷新目录确认实际位置后再操作。", path: null };
     }
   },
 
@@ -684,9 +708,10 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
 
   async materializePrivateWorkspace(args) {
     const root = findRoot("private");
-    if (!root) return { ok: false, message: "私有目录无法创建。", migrated: false, path: "" };
+    if (!root) return { ok: false, message: "私有目录无法创建。", migrated: false, done: false, path: "" };
     const marker = join(dirname(root.path), ".private-workspace-migrated-v1");
-    if (existsSync(marker)) return { ok: true, message: "私有目录已使用磁盘存储。", migrated: false, path: root.path };
+    if (existsSync(marker)) return { ok: true, message: "私有目录已使用磁盘存储。", migrated: false, done: true, path: root.path };
+    if (!args.final && !args.entries.length) return { ok: true, message: "私有目录尚未迁移。", migrated: false, done: false, path: root.path };
     try {
       const folders = args.entries.filter((entry) => entry.kind === "folder").sort((a, b) => a.path.split("/").length - b.path.split("/").length);
       const files = args.entries.filter((entry) => entry.kind === "file");
@@ -699,14 +724,16 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
           continue;
         }
         mkdirSync(dirname(target.absolute), { recursive: true });
+        // An earlier, interrupted run may already have written it.
         if (existsSync(target.absolute)) continue;
         if (entry.dataBase64 === null) throw new Error("missing file data");
         writeFileSync(target.absolute, Buffer.from(entry.dataBase64, "base64"), { flag: "wx" });
       }
+      if (!args.final) return { ok: true, message: "迁移进行中。", migrated: false, done: false, path: root.path };
       writeFileSync(marker, `${new Date().toISOString()}\n`, { encoding: "utf8", flag: "wx" });
-      return { ok: true, message: args.entries.length ? `已把 ${args.entries.length} 个原有项目迁移到真实目录。` : "私有目录已切换为真实磁盘目录。", migrated: args.entries.length > 0, path: root.path };
+      return { ok: true, message: "私有目录已切换为真实磁盘目录。", migrated: true, done: true, path: root.path };
     } catch {
-      return { ok: false, message: "原有私有数据迁移未完成；旧数据仍保留，请重试。", migrated: false, path: root.path };
+      return { ok: false, message: "原有私有数据迁移未完成；旧数据仍保留，下次打开私有目录时会继续。", migrated: false, done: false, path: root.path };
     }
   },
 
@@ -723,15 +750,14 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const mode = selectShellExecutionMode(args.runAsRoot, typeof process.getuid === "function" ? process.getuid() : undefined);
     const [file, spawnArgs] = shellSpawnArgs(mode, wrappedCommand);
     return new Promise((resolvePromise) => {
-      const output = { stdout: "", stderr: "" };
+      const output = { stdout: createOutputCollector(), stderr: createOutputCollector() };
       let timedOut = false;
       let settled = false;
       // detached puts the shell in its own process group so a timeout kills
       // background children too, not just bash.
       const child = spawn(file, spawnArgs, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, TERM: "xterm-256color" } });
-      const collect = (key: "stdout" | "stderr") => (chunk: Buffer) => { if (output[key].length < 1_000_000) output[key] += chunk.toString("utf8"); };
-      child.stdout.on("data", collect("stdout"));
-      child.stderr.on("data", collect("stderr"));
+      child.stdout.on("data", (chunk: Buffer) => output.stdout.push(chunk));
+      child.stderr.on("data", (chunk: Buffer) => output.stderr.push(chunk));
       const killGroup = () => {
         try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
       };
@@ -743,16 +769,22 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         child.stderr.destroy();
         const durationMs = Math.max(0, Date.now() - started);
         if (mode === "sudo" && code === 137 && durationMs >= SHELL_TIMEOUT_MS - 500) timedOut = true;
-        const markerIndex = output.stdout.lastIndexOf(`\n${marker}`);
+        const stdout = output.stdout.finish();
+        const errors = output.stderr.finish();
+        const clipped = `\n…（输出超过 ${SHELL_OUTPUT_MAX_CHARS} 字符，已截断）`;
+        // The cwd marker is printed last; past the cap it is only in the kept tail.
+        const markerSource = stdout.truncated ? stdout.tail : stdout.text;
+        const markerIndex = markerSource.lastIndexOf(`\n${marker}`);
         let nextCwd = cwd;
-        let cleanStdout = output.stdout;
+        let cleanStdout = stdout.truncated ? stdout.text + clipped : stdout.text;
         if (markerIndex >= 0) {
-          const markerEnd = output.stdout.indexOf("\n", markerIndex + 1);
-          const capturedCwd = output.stdout.slice(markerIndex + 1 + marker.length, markerEnd >= 0 ? markerEnd : output.stdout.length).trim();
+          const markerEnd = markerSource.indexOf("\n", markerIndex + 1);
+          const capturedCwd = markerSource.slice(markerIndex + 1 + marker.length, markerEnd >= 0 ? markerEnd : markerSource.length).trim();
           if (capturedCwd) nextCwd = capturedCwd;
-          cleanStdout = output.stdout.slice(0, markerIndex) + output.stdout.slice(markerEnd >= 0 ? markerEnd + 1 : output.stdout.length);
+          if (!stdout.truncated) cleanStdout = stdout.text.slice(0, markerIndex) + stdout.text.slice(markerEnd >= 0 ? markerEnd + 1 : stdout.text.length);
         }
-        const stderr = timedOut ? `${output.stderr}${output.stderr ? "\n" : ""}命令超过 ${SHELL_TIMEOUT_MS / 1000} 秒，已终止。` : output.stderr;
+        const errorText = errors.truncated ? errors.text + clipped : errors.text;
+        const stderr = timedOut ? `${errorText}${errorText ? "\n" : ""}命令超过 ${SHELL_TIMEOUT_MS / 1000} 秒，已终止。` : errorText;
         resolvePromise({ ok: code === 0 && !timedOut, stdout: cleanStdout, stderr, exitCode: timedOut ? null : code, timedOut, cwd: nextCwd, durationMs });
       };
       const timer = setTimeout(() => {
@@ -761,7 +793,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         // Under sudo the root shell may outlive the kill; answer anyway.
         setTimeout(() => finish(null), 500);
       }, SHELL_TIMEOUT_MS);
-      child.on("error", (error) => { output.stderr += error.message; finish(null); });
+      child.on("error", (error) => { output.stderr.push(new TextEncoder().encode(error.message)); finish(null); });
       child.on("close", (code) => finish(code));
       // A background job that keeps stdout open must not hold the answer until the timeout.
       child.on("exit", (code) => { setTimeout(() => finish(code), 250); });

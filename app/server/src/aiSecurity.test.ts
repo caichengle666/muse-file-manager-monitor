@@ -1,11 +1,27 @@
 import { describe, expect, test } from "bun:test";
-import { AiEmptyOutputError, AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, extractAiMessageCommand, isPrivateAddress, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { AiEmptyOutputError, AiRequestError, constantTimeEqual, describeAiError, digestToken, extractAiContent, extractAiMessageCommand, isPrivateAddress, isPrivateHostname, normalizeAiBaseUrl, parseAiCommandContent, randomToken, requirePublicBaseUrl, sameAiOrigin } from "./aiSecurity";
 
 describe("SSRF guard", () => {
   test("accepts public OpenAI-compatible hosts", () => {
     expect(requirePublicBaseUrl("https://api.openai.com")).toBe("https://api.openai.com/v1");
     expect(requirePublicBaseUrl("https://api.deepseek.com/v1/")).toBe("https://api.deepseek.com/v1");
-    expect(requirePublicBaseUrl("http://example.com/proxy")).toBe("http://example.com/proxy/v1");
+    expect(requirePublicBaseUrl("https://api.openai.com/")).toBe("https://api.openai.com/v1");
+  });
+
+  test("keeps an explicit provider path as typed (only a bare host gets /v1)", () => {
+    expect(requirePublicBaseUrl("http://example.com/proxy")).toBe("http://example.com/proxy");
+    expect(requirePublicBaseUrl("https://api.deepinfra.com/v1/openai")).toBe("https://api.deepinfra.com/v1/openai");
+    expect(requirePublicBaseUrl("https://generativelanguage.googleapis.com/v1beta/openai/")).toBe("https://generativelanguage.googleapis.com/v1beta/openai");
+    expect(requirePublicBaseUrl("https://open.bigmodel.cn/api/paas/v4")).toBe("https://open.bigmodel.cn/api/paas/v4");
+    expect(requirePublicBaseUrl("https://ark.cn-beijing.volces.com/api/v3")).toBe("https://ark.cn-beijing.volces.com/api/v3");
+    expect(requirePublicBaseUrl.bind(null, "http://127.0.0.1/v1beta/openai")).toThrow();
+  });
+
+  test("reuses a saved API key only for the origin it was saved for", () => {
+    expect(sameAiOrigin("https://api.openai.com/v1", "https://api.openai.com/v2")).toBe(true);
+    expect(sameAiOrigin("https://api.openai.com/v1", "https://evil.example.com/v1")).toBe(false);
+    expect(sameAiOrigin("https://api.openai.com/v1", "http://api.openai.com/v1")).toBe(false);
+    expect(sameAiOrigin("not a url", "https://api.openai.com/v1")).toBe(false);
   });
 
   test("rejects localhost, private ranges, link-local and metadata hosts", () => {

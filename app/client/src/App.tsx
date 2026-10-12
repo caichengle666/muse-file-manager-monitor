@@ -13,7 +13,7 @@ XAxis,
 YAxis,
 } from "recharts";
 import { api, type ApiResponse } from "./api";
-import { SHELL_TIMEOUT_MS } from "../../server/src/shellExecution";
+import { SHELL_TIMEOUT_MS, clipStep } from "../../server/src/shellExecution";
 
 type HostListing = ApiResponse<typeof api, "listHostDirectory">;
 type HostEntry = HostListing["entries"][number];
@@ -32,6 +32,7 @@ type TerminalEntry = { command: string; stdout: string; stderr: string; exitCode
 type AgentStep = { command: string; stdout: string; stderr: string; cwd: string; exitCode: number | null; requiresConfirmation: boolean };
 type AgentDiagnostic = { phase: string; url: string; status: number | null; model: string; detail: string; responseSnippet: string; contentSnippet: string };
 type AgentMessage = { role: "user" | "assistant"; text: string; steps?: AgentStep[]; diagnostic?: AgentDiagnostic | null };
+type AiContext = Awaited<ReturnType<typeof api.getAiContext>>;
 type MonitorHistory = { time: string; cpu: number; memory: number; rx: number; tx: number; [key: string]: string | number };
 type DirectoryUsage = { name: string; path: string; size: number; timedOut: boolean };
 type ImageViewerState = {
@@ -123,10 +124,10 @@ function formatLocalDateTime(iso: string): string {
 }
 
 const SHELL_TIMEOUT_SECONDS = SHELL_TIMEOUT_MS / 1000;
-// One runAiTask call is one model turn (server AI_AGENT_REQUEST_TIMEOUT_MS, 100 s) or
+// One runAiTask call is one model turn (server AI_AGENT_REQUEST_TIMEOUT_MS, 60 s) or
 // one command (25 s); past this the request is treated as lost so the panel never
 // stays busy forever. aiSecurity.ts pulls in node modules, so it is not imported here.
-const AI_CALL_TIMEOUT_MS = 130_000;
+const AI_CALL_TIMEOUT_MS = 75_000;
 const AI_BUSY_RETRY_MS = 2_000;
 const sleep = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -158,7 +159,6 @@ export function App() {
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>([]);
   const [terminalBusy, setTerminalBusy] = useState(false);
   const terminalCwdRef = useRef<Record<string, string>>({});
-  const agentMirrorRef = useRef(0);
   const hostUploadRef = useRef<HTMLInputElement>(null);
 
   const privateMigratedRef = useRef(false);
@@ -166,10 +166,12 @@ export function App() {
   const hostQuery = useQuery({
     queryKey: ["host-directory", fileMode, hostPath, showSensitive],
     queryFn: async () => {
+      // Tried once per page load; a failed migration only shows a notice, since the
+      // private directory lists fine without it.
       if (fileMode === "private" && !privateMigratedRef.current) {
-        const migration = await api.migratePrivateWorkspace({});
-        if (!migration.ok) throw new Error(migration.message);
         privateMigratedRef.current = true;
+        const migration = await api.migratePrivateWorkspace({}).catch(() => ({ ok: false, message: "原有私有数据迁移未完成；旧数据仍保留，下次打开私有目录时会继续。" }));
+        if (!migration.ok) setNotice(migration.message);
       }
       return api.listHostDirectory({ root: fileMode, path: hostPath, showSensitive });
     },
@@ -323,10 +325,8 @@ export function App() {
   }
 
   function mirrorAgentSteps(steps: AgentStep[]) {
-    if (steps.length < agentMirrorRef.current) agentMirrorRef.current = 0;
-    if (steps.length <= agentMirrorRef.current) return;
-    const appended = steps.slice(agentMirrorRef.current).map((step) => ({ command: step.command, stdout: step.stdout, stderr: step.stderr, exitCode: step.exitCode, timedOut: false, cwd: step.cwd, durationMs: 0, source: "agent" as const }));
-    agentMirrorRef.current = steps.length;
+    if (!steps.length) return;
+    const appended = steps.map((step) => ({ command: step.command, stdout: step.stdout, stderr: step.stderr, exitCode: step.exitCode, timedOut: false, cwd: step.cwd, durationMs: 0, source: "agent" as const }));
     setTerminalHistory((current) => [...current, ...appended].slice(-30));
   }
 
@@ -423,7 +423,7 @@ export function App() {
         ) : null}
         {/* Kept mounted on every tab: an AI task loop must survive a tab switch, or the
             remounted panel loses track of the running task and its busy state. */}
-        <TerminalView hidden={tab !== "terminal"} entries={terminalHistory} busy={terminalBusy} onRun={runTerminal} onClear={() => { setTerminalHistory([]); agentMirrorRef.current = 0; }} onAgentSteps={mirrorAgentSteps} />
+        <TerminalView hidden={tab !== "terminal"} entries={terminalHistory} busy={terminalBusy} onRun={runTerminal} onClear={() => setTerminalHistory([])} onAgentSteps={mirrorAgentSteps} />
         </main>
       </div>
 
@@ -520,13 +520,60 @@ function TerminalView({ hidden, entries, busy, onRun, onClear, onAgentSteps }: {
   const [agentExpanded, setAgentExpanded] = useState(() => window.matchMedia("(min-width: 720px)").matches);
   const [agentContextLoaded, setAgentContextLoaded] = useState(false);
   const agentStepCountRef = useRef(0);
+  const contextVersionRef = useRef(0);
+  // The transcript as the server last had it; an unchanged one is not saved again.
+  const lastSavedRef = useRef("");
+  const aiBusyRef = useRef(false);
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
   const outputRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   useEffect(() => { outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight }); }, [entries, busy]);
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight }); }, [agentMessages, aiBusy]);
-  useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiKeyHint(result.hasApiKey ? result.apiKeyHint : ""); setAiModel(result.model); setAiConfigured(result.configured); setAiConfigOpen(!result.configured); }); }, []);
-  useEffect(() => { void api.getAiContext({}).then((result) => { setRoot(result.root); setPath(result.path); setAgentTaskId(result.taskId); setAgentPending(result.pendingCommand); setAgentMessages(result.messages); agentStepCountRef.current = result.messages.reduce((count, message) => count + (message.steps?.length ?? 0), 0); setAgentContextLoaded(true); }); }, []);
-  useEffect(() => { if (!agentContextLoaded) return; void api.saveAiContext({ taskId: agentTaskId, root, path, pendingCommand: agentPending, messages: agentMessages }); }, [agentContextLoaded, agentMessages, agentPending, agentTaskId, path, root]);
+  useEffect(() => { void api.getAiProviderConfig({}).then((result) => { setAiBaseUrl(result.baseUrl); setAiKeyHint(result.hasApiKey ? result.apiKeyHint : ""); setAiModel(result.model); setAiConfigured(result.configured); setAiConfigOpen(!result.configured); }).catch(() => setAiConfigOpen(true)); }, []);
+  function adoptAgentContext(context: AiContext) {
+    contextVersionRef.current = context.version;
+    lastSavedRef.current = JSON.stringify({ root: context.root, path: context.path, messages: context.messages });
+    setRoot(context.root);
+    setPath(context.path);
+    setAgentTaskId(context.taskId);
+    setAgentPending(context.pendingCommand);
+    setAgentToken(null);
+    setAgentMessages(context.messages);
+    agentStepCountRef.current = context.stepCount;
+  }
+  // A failed load still turns saving on: the first save then carries version 0, and
+  // if the server holds a newer context it answers with it and the page adopts it.
+  useEffect(() => {
+    void api.getAiContext({}).then(adoptAgentContext).catch(() => appendAgentMessage({ role: "assistant", text: "读取 AI 对话记录失败，已从空白对话开始。" })).finally(() => setAgentContextLoaded(true));
+  }, []);
+  // Another device may have moved the shared task on; pick that up when this panel
+  // comes back into view, unless this page is driving the task right now.
+  useEffect(() => {
+    if (hidden || !agentContextLoaded) return;
+    // Pending saves land first, so the refresh never rolls back this page's own messages.
+    const refresh = () => { if (document.visibilityState === "visible" && !aiBusyRef.current) void saveChainRef.current.then(() => api.getAiContext({})).then((context) => { if (!aiBusyRef.current) adoptAgentContext(context); }).catch(() => { /* keep the current view */ }); };
+    refresh();
+    document.addEventListener("visibilitychange", refresh);
+    return () => document.removeEventListener("visibilitychange", refresh);
+  }, [hidden, agentContextLoaded]);
+  useEffect(() => { aiBusyRef.current = aiBusy; }, [aiBusy]);
+  useEffect(() => {
+    if (!agentContextLoaded) return;
+    // Step output is capped like the server's, so a save never exceeds its limits.
+    const snapshot = { root, path, messages: agentMessages.map((message) => (message.steps ? { ...message, steps: message.steps.map(clipStep) } : message)) };
+    const serialized = JSON.stringify(snapshot);
+    if (serialized === lastSavedRef.current) return;
+    lastSavedRef.current = serialized;
+    // Saves run one at a time so each carries the version the previous one produced.
+    saveChainRef.current = saveChainRef.current.then(async () => {
+      try {
+        const result = await api.saveAiContext({ version: contextVersionRef.current, ...snapshot });
+        if (result.ok) contextVersionRef.current = result.version;
+        else if (result.context && !aiBusyRef.current) adoptAgentContext(result.context);
+        else contextVersionRef.current = result.version;
+      } catch { /* the next change saves again */ }
+    });
+  }, [agentContextLoaded, agentMessages, path, root]);
   function submit(event: FormEvent) { event.preventDefault(); const value = command.trim(); if (!value || busy) return; setCommand(""); void onRun(value, root, path); }
   const aiKeyAvailable = Boolean(aiApiKey.trim() || aiKeyHint);
   async function saveAi() {
@@ -557,6 +604,8 @@ function TerminalView({ hidden, entries, busy, onRun, onClear, onAgentSteps }: {
     setAiBusy(true);
     try {
       await api.clearAiContext({});
+      contextVersionRef.current = 0;
+      lastSavedRef.current = JSON.stringify({ root, path, messages: [] });
       setAgentMessages([]);
       setAgentTaskId(null);
       setAgentPending("");
@@ -585,19 +634,20 @@ function TerminalView({ hidden, entries, busy, onRun, onClear, onAgentSteps }: {
       // gateway never sees a multi-minute request. Keep driving the loop here until
       // the task finishes or needs user confirmation.
       for (let round = 0; round < maxRounds; round += 1) {
-        const result = await withTimeout(api.runAiTask({ taskId: activeTaskId, root, path, ...request }), AI_CALL_TIMEOUT_MS);
+        const result = await withTimeout(api.runAiTask({ taskId: activeTaskId, root, path, knownSteps: activeTaskId ? agentStepCountRef.current : 0, ...request }), AI_CALL_TIMEOUT_MS);
         request = { prompt: "", reject: false, confirmToken: null };
         // Another call still holds this task (an earlier page, another device);
         // wait for it instead of spinning through every round.
         if (!result.ok && result.status === "running") await sleep(AI_BUSY_RETRY_MS);
-        const newSteps = result.steps.slice(agentStepCountRef.current);
-        agentStepCountRef.current = result.steps.length;
+        // The server returns only the steps after knownSteps.
+        const newSteps = result.steps;
+        agentStepCountRef.current = result.stepCount;
         activeTaskId = result.status === "completed" || result.status === "failed" ? null : result.taskId;
         setAgentTaskId(activeTaskId);
         setAgentPending(result.status === "waiting_confirmation" ? result.pendingCommand ?? "" : "");
         setAgentToken(result.confirmToken ?? null);
         if (newSteps.length > 0 || result.status !== "running") appendAgentMessage({ role: "assistant", text: result.message || (result.status === "completed" ? "任务已完成。" : ""), steps: newSteps, diagnostic: result.diagnostic ?? null });
-        onAgentSteps(result.steps);
+        onAgentSteps(newSteps);
         if (result.status === "completed" || result.status === "failed") { agentStepCountRef.current = 0; break; }
         if (result.status === "waiting_confirmation") break;
         if (round === maxRounds - 1) appendAgentMessage({ role: "assistant", text: `已达到单次 ${maxRounds} 轮（约 ${maxRounds / 2} 步）的上限，任务暂停。点「继续」接着执行。` });
@@ -615,7 +665,8 @@ function TerminalView({ hidden, entries, busy, onRun, onClear, onAgentSteps }: {
       let result: Awaited<ReturnType<typeof api.runAiTask>>;
       setAiBusy(true);
       try {
-        result = await withTimeout(api.runAiTask({ taskId: agentTaskId, root, path, prompt: "", reject: false, confirmToken: null }), AI_CALL_TIMEOUT_MS);
+        // knownSteps stays where it is: a step this call runs comes back with the next call.
+        result = await withTimeout(api.runAiTask({ taskId: agentTaskId, root, path, prompt: "", reject: false, confirmToken: null, knownSteps: agentStepCountRef.current }), AI_CALL_TIMEOUT_MS);
       } catch (error) {
         appendAgentMessage({ role: "assistant", text: `请求失败：${error instanceof Error ? error.message : "未知错误"}` });
         return;
@@ -641,7 +692,7 @@ function TerminalView({ hidden, entries, busy, onRun, onClear, onAgentSteps }: {
   }
   return <section hidden={hidden} className={`terminal-panel ${agentExpanded ? "ai-open" : "ai-closed"}`} aria-label="终端">
     <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 {SHELL_TIMEOUT_SECONDS} 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
-    <div className={`terminal-location ${locationOpen ? "is-open" : "is-collapsed"}`}><button type="button" className="terminal-location-toggle" onClick={() => setLocationOpen((open) => !open)} aria-expanded={locationOpen}>执行位置 <span>{root === "workspace" ? "工作区" : root} · {path || "根目录"}</span><b>{locationOpen ? "收起" : "展开"}</b></button><div className="terminal-location-fields"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div></div>
+    <div className={`terminal-location ${locationOpen ? "is-open" : "is-collapsed"}`}><button type="button" className="terminal-location-toggle" onClick={() => setLocationOpen((open) => !open)} aria-expanded={locationOpen}>执行位置 <span>{root === "workspace" ? "工作区" : root} · {path || "根目录"}</span><b>{locationOpen ? "收起" : "展开"}</b></button><div className="terminal-location-fields"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option><option value="private">私有文件</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div></div>
     <div id="ai-agent-panel" className="ai-terminal-panel">
       <div className="ai-terminal-heading">
         <div><strong>AI 终端 Agent</strong><small>{aiConfigured ? "已连接外部 OpenAI 兼容接口" : "先配置外部模型接口"}</small></div>

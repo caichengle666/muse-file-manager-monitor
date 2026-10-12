@@ -27,7 +27,7 @@ const SAFE_TARGET = /^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/;
 const WRITE_REDIRECTS = new Set([">", ">>", ">|", "&>", "&>>", "<>"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/;
 const RESERVED_SKIP = new Set(["!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "esac", "]]"]);
-const BLOCK_START = new Set(["for", "case", "select", "function", "[[", "[", "test"]);
+const BLOCK_START = new Set(["for", "case", "select", "[[", "[", "test"]);
 const SHELLS = new Set(["sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "fish", "csh", "tcsh"]);
 const ALWAYS_WRITE = new Set([
   "rm", "rmdir", "unlink", "shred", "wipe", "truncate", "mv", "cp", "install", "rsync", "scp", "touch",
@@ -45,6 +45,11 @@ const INLINE_WRITE = new RegExp([
   String.raw`\bBun\.write\b|\bDeno\.(?:write\w*|remove|rename|mkdir|truncate|chmod|chown|symlink|link|copyFile|create)\b`,
   String.raw`\b(?:File|IO)\.(?:write|delete|unlink|rename|symlink|link|chmod|chown|truncate)\b|\bFileUtils\.\w+|\bDir\.(?:mkdir|rmdir|delete|unlink)\b`,
 ].join("|"));
+// GNU sed runs shell commands with the `e` command (optionally addressed) and the
+// `e` flag of `s///`.
+const SED_ADDRESS = String.raw`(?:[0-9$]+(?:~[0-9]+)?|\/(?:[^/\\]|\\.)*\/[IM]*)`;
+const SED_EXECUTE = new RegExp(String.raw`(?:^|[;\n{}])\s*(?:${SED_ADDRESS}(?:\s*,\s*${SED_ADDRESS})?)?\s*!?\s*e(?:\s|;|}|$)`);
+const SED_SUBSTITUTE_EXECUTE = /(?:^|[^\w])s([^\w\s\\])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImM0-9]*e/;
 const INLINE_SPAWN = /\b(?:system|popen|Popen|exec\w*|spawn\w*|subprocess|child_process|shell_exec|passthru|proc_open)\b|`|%x|\bqx\b/;
 
 const isDynamic = (text: string): boolean => text.includes(DYN);
@@ -70,11 +75,14 @@ class Lexer {
       if (c === "\n") { this.i += 1; this.readHeredocs(); this.end(false); continue; }
       if (c === "#") { while (this.i < s.length && s[this.i] !== "\n") this.i += 1; continue; }
       if (this.inDoubleBracket() && (c === "<" || c === ">")) { this.cur.words.push({ text: c, glob: false, quoted: true }); this.i += 1; continue; }
+      // `(( … ))` is arithmetic only when it closes with `))`; `((cmd) )` is two subshells.
       if (c === "(" && next === "(" && !this.cur.words.length) {
         const end = this.balanced(this.i + 1);
-        this.scanExpansions(s.slice(this.i + 2, end - 1));
-        this.i = s[end] === ")" ? end + 1 : end;
-        continue;
+        if (s[end] === ")") {
+          this.scanExpansions(s.slice(this.i + 2, end - 1));
+          this.i = end + 1;
+          continue;
+        }
       }
       if (c === ";") { this.i += next === ";" || next === "&" ? 2 : 1; this.end(false); continue; }
       if (c === "&" && next !== ">") { this.i += next === "&" ? 2 : 1; this.end(false); continue; }
@@ -136,6 +144,9 @@ class Lexer {
     let text = "";
     let glob = false;
     let quoted = false;
+    // Unquoted brace expansion ({a,b} or {a..b}) can build the command name.
+    let braceOpen = false;
+    let braceList = false;
     while (this.i < s.length) {
       const c = s[this.i] ?? "";
       if ((c === "<" || c === ">") && s[this.i + 1] === "(") {
@@ -159,6 +170,9 @@ class Lexer {
       if (c === "$") { text += this.readDollar(false); continue; }
       if (c === "`") { text += this.readBacktick(); continue; }
       if (c === "*" || c === "?" || c === "[") glob = true;
+      if (c === "{") braceOpen = true;
+      else if (braceOpen && (c === "," || (c === "." && s[this.i + 1] === "."))) braceList = true;
+      else if (c === "}" && braceList) glob = true;
       text += c;
       this.i += 1;
     }
@@ -297,26 +311,36 @@ function parseOptions(args: Word[], spec: { value?: string; optional?: string; d
 const has = (parsed: Options, ...names: string[]): boolean => parsed.opts.some(([name]) => names.includes(name));
 const values = (parsed: Options, ...names: string[]): string[] => parsed.opts.filter(([name, value]) => names.includes(name) && value !== true).map(([, value]) => value as string);
 
-function assessText(command: string, depth: number): string | null {
+// pipedIn: the first command reads data that cannot be known (awk `print | "sh"`).
+function assessText(command: string, depth: number, pipedIn = false): string | null {
   if (depth > MAX_DEPTH) return "命令嵌套过深，无法静态判断";
   const lexer = new Lexer(command).run();
   for (const inner of lexer.nested) {
     const reason = assessText(inner, depth + 1);
     if (reason) return reason;
   }
-  for (const segment of lexer.segments) {
-    const reason = assessSegment(segment, depth);
+  for (const [index, segment] of lexer.segments.entries()) {
+    const reason = assessSegment(segment, depth, pipedIn && index === 0);
     if (reason) return reason;
   }
   return null;
 }
 
-function assessSegment(segment: Segment, depth: number): string | null {
+// Command strings handed to a shell by a wrapper (`su -c`, `flock -c`, `script -c`).
+function assessShellStrings(label: string, commands: string[], depth: number): string | null {
+  for (const command of commands) {
+    const reason = isDynamic(command) ? `${label} 执行动态生成的命令` : assessText(command, depth + 1);
+    if (reason) return reason;
+  }
+  return null;
+}
+
+function assessSegment(segment: Segment, depth: number, pipedIn = false): string | null {
   for (const redirect of segment.redirects) {
     const writes = WRITE_REDIRECTS.has(redirect.op) || (redirect.op === ">&" && !/^(?:\d+|-)$/.test(redirect.target.text));
     if (writes && (redirect.target.glob || !isSafeTarget(redirect.target.text))) return `输出重定向会写入文件：${show(redirect.target.text) || "(空)"}`;
   }
-  const stdin: Stdin = { texts: [...segment.stdin], unknown: false };
+  const stdin: Stdin = { texts: [...segment.stdin], unknown: pipedIn };
   if (segment.pipedFrom) {
     const piped = staticEcho(segment.pipedFrom);
     if (piped === null) stdin.unknown = true;
@@ -336,7 +360,14 @@ function staticEcho(segment: Segment): string | null {
 function assessWords(words: Word[], depth: number, stdin: Stdin): string | null {
   if (depth > MAX_DEPTH) return "命令嵌套过深，无法静态判断";
   let index = 0;
-  while (index < words.length && (ASSIGNMENT.test(words[index]?.text ?? "") || RESERVED_SKIP.has(words[index]?.text ?? ""))) index += 1;
+  while (index < words.length) {
+    const text = words[index]?.text ?? "";
+    // `function NAME { body }` and `coproc [NAME] { body }` / `coproc cmd`: assess what follows.
+    if (text === "function") index += 2;
+    else if (text === "coproc") index += words[index + 2]?.text === "{" ? 2 : 1;
+    else if (ASSIGNMENT.test(text) || RESERVED_SKIP.has(text)) index += 1;
+    else break;
+  }
   const nameWord = words[index];
   if (!nameWord || BLOCK_START.has(nameWord.text)) return null;
   if (isDynamic(nameWord.text) || nameWord.glob) return "命令名是动态生成的（变量、命令替换、通配符或转义），可能隐藏删除操作";
@@ -441,7 +472,8 @@ function assessAwk(name: string, args: Word[], depth: number): string | null {
     for (let previous = ""; previous !== flat;) { previous = flat; flat = flat.replace(/\([^()]*\)/g, ""); }
     for (const match of flat.matchAll(/\bprintf?\b[^;{}\n]*?(>>?|\|)\s*(?:"([^"]*)"|(\S+))/g)) {
       if (match[1] === "|") {
-        const reason = match[2] === undefined ? `${name} 把输出交给动态命令执行` : assessText(match[2], depth + 1);
+        // The printed text becomes the command's stdin, so a shell there runs it.
+        const reason = match[2] === undefined ? `${name} 把输出交给动态命令执行` : assessText(match[2], depth + 1, true);
         if (reason) return reason;
       } else if (match[2] === undefined || !SAFE_TARGET.test(match[2])) {
         return `${name} 输出重定向会写入文件`;
@@ -547,6 +579,40 @@ function assessCommandName(name: string, args: Word[], depth: number, stdin: Std
     }
     case "nohup": case "builtin": case "busybox": case "setsid": case "chronic": case "unbuffer":
       return wrapped(parseOptions(args, {}).rest);
+    case "setpriv": return wrapped(parseOptions(args, { long: ["--reuid", "--regid", "--ruid", "--euid", "--rgid", "--egid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits", "--pdeathsig", "--selinux-label", "--apparmor-profile", "--landlock-access", "--landlock-rule", "--seccomp-filter"] }).rest);
+    case "nsenter": return wrapped(parseOptions(args, { value: "tSG", optional: "muinpUCTrw", long: ["--target", "--setuid", "--setgid", "--env"] }).rest);
+    case "unshare": return wrapped(parseOptions(args, { value: "SGRw", optional: "muinpUCT", long: ["--setuid", "--setgid", "--root", "--wd", "--propagation", "--setgroups", "--map-user", "--map-group", "--map-users", "--map-groups", "--kill-child"] }).rest);
+    case "taskset": {
+      // `taskset [opts] MASK|LIST cmd`; with -p it changes an existing process.
+      const parsed = parseOptions(args, {});
+      return has(parsed, "-p", "--pid") ? null : wrapped(parsed.rest + 1);
+    }
+    case "chrt": {
+      const parsed = parseOptions(args, { value: "TPD", long: ["--sched-runtime", "--sched-period", "--sched-deadline"] });
+      return has(parsed, "-p", "--pid", "-m", "--max") ? null : wrapped(parsed.rest + 1);
+    }
+    case "flock": {
+      // `flock [opts] FILE cmd…` or `flock [opts] FILE -c 'cmd'`; options may follow FILE.
+      const spec = { value: "wEc", long: ["--timeout", "--wait", "--conflict-exit-code", "--command"] };
+      const before = parseOptions(args, spec);
+      const after = parseOptions(args.slice(before.rest + 1), spec);
+      const commands = [...values(before, "-c", "--command"), ...values(after, "-c", "--command")];
+      return commands.length ? assessShellStrings("flock -c", commands, depth) : wrapped(before.rest + 1 + after.rest);
+    }
+    case "runuser": {
+      const parsed = parseOptions(args, { value: "ugGcsw", long: ["--user", "--group", "--supp-group", "--command", "--session-command", "--shell", "--whitelist-environment"], permute: true });
+      const commands = values(parsed, "-c", "--command", "--session-command");
+      if (commands.length) return assessShellStrings("runuser -c", commands, depth);
+      // `runuser -u USER [--] cmd…` runs cmd directly.
+      return has(parsed, "-u", "--user") ? wrapped(parseOptions(args, { value: "ugGsw", long: ["--user", "--group", "--supp-group", "--shell", "--whitelist-environment"] }).rest) : null;
+    }
+    case "script": {
+      const parsed = parseOptions(args, { value: "cETIOBm", long: ["--command", "--echo", "--log-timing", "--log-in", "--log-out", "--log-io", "--logging-format", "--output-limit"], permute: true });
+      const reason = assessShellStrings("script -c", values(parsed, "-c", "--command"), depth);
+      if (reason) return reason;
+      const logs = [...values(parsed, "-T", "--log-timing", "-I", "--log-in", "-O", "--log-out", "-B", "--log-io"), parsed.positionals[0]?.text ?? "typescript"];
+      return unsafe(logs) ? "script 会写入记录文件" : null;
+    }
     case "chroot": return wrapped(parseOptions(args, { long: ["--userspec", "--groups"] }).rest + 1);
     case "watch": {
       const parsed = parseOptions(args, { value: "nq", long: ["--interval"] });
@@ -555,12 +621,9 @@ function assessCommandName(name: string, args: Word[], depth: number, stdin: Std
       return rest.length ? assessText(rest.join(" "), depth + 1) : null;
     }
     case "su": {
-      const parsed = parseOptions(args, { value: "cgGsw", long: ["--command", "--session-command", "--shell", "--group", "--supp-group", "--whitelist-environment"] });
-      for (const command of values(parsed, "-c", "--command", "--session-command")) {
-        const reason = isDynamic(command) ? "su -c 执行动态生成的命令" : assessText(command, depth + 1);
-        if (reason) return reason;
-      }
-      return null;
+      // Options may follow the user (`su root -c '…'`, `su - root -c '…'`).
+      const parsed = parseOptions(args, { value: "cgGsw", long: ["--command", "--session-command", "--shell", "--group", "--supp-group", "--whitelist-environment"], permute: true });
+      return assessShellStrings("su -c", values(parsed, "-c", "--command", "--session-command"), depth);
     }
     case "eval": {
       const text = args.map((word) => word.text).join(" ");
@@ -592,6 +655,7 @@ function assessCommandName(name: string, args: Word[], depth: number, stdin: Std
       if (has(parsed, "-i", "--in-place")) return "sed -i 会原地修改文件";
       const scripts = values(parsed, "-e", "--expression");
       if (!scripts.length && !has(parsed, "-f", "--file") && parsed.positionals[0]) scripts.push(parsed.positionals[0].text);
+      if (scripts.some((script) => SED_EXECUTE.test(script) || SED_SUBSTITUTE_EXECUTE.test(script))) return "sed 的 e 命令会执行 shell 命令";
       return scripts.some((script) => /(?:^|[;\n{}])\s*[0-9,$]*\s*[wW]\s+\S|\/[gpiImMe0-9]*w\s+\S/.test(script)) ? "sed 的 w 命令会写入文件" : null;
     }
     case "awk": case "gawk": case "mawk": case "nawk": return assessAwk(name, args, depth);

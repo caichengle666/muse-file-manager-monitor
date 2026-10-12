@@ -1,9 +1,11 @@
 import { defineAction, z, type ActionsModule, type SpaceDb } from "@hatch/space-sdk";
-import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiEmptyOutputError, AiRequestError, type AiDiagnostic, assertPublicResolution, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, requirePublicBaseUrl } from "./aiSecurity";
+import { AI_AGENT_REQUEST_TIMEOUT_MS, AI_REQUEST_TIMEOUT_MS, AiEmptyOutputError, AiRequestError, type AiDiagnostic, assertPublicResolution, constantTimeEqual, describeAiError, digestToken, extractAiMessageCommand, parseAiCommandContent, randomToken, requirePublicBaseUrl, sameAiOrigin } from "./aiSecurity";
 import { eq, sql } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import { assessCommand } from "./commandPolicy";
 import * as schema from "./schema";
+import { AI_STEP_OUTPUT_MAX_CHARS, SHELL_COMMAND_MAX_CHARS, clipStep } from "./shellExecution";
+import { AI_TASK_MAX_STEPS, recordStep, stepsSince } from "./aiTask";
 
 type Db = SpaceDb<typeof schema>;
 type Row = typeof schema.workspaceItems.$inferSelect;
@@ -63,6 +65,9 @@ async function loadRestartRecord(db: Db): Promise<RestartRecord> {
   return restartRecordPromise;
 }
 
+// Per privileged call: matches the contract's per-file limit (a 12 MB file).
+const PRIVATE_MIGRATION_BATCH_CHARS = 16_000_000;
+
 function encodeBase64(bytes: Uint8Array): string {
   let binary = "";
   for (let index = 0; index < bytes.byteLength; index += 32_768) {
@@ -75,6 +80,10 @@ async function readAiConfig(db: Db): Promise<typeof schema.aiProviderConfig.$inf
   await ensureTables(db);
   const [config] = await db.select().from(schema.aiProviderConfig).where(eq(schema.aiProviderConfig.id, 1)).limit(1);
   return config ?? null;
+}
+
+function savedKeyFor(config: typeof schema.aiProviderConfig.$inferSelect | null, baseUrl: string): string {
+  return config?.apiKey && sameAiOrigin(config.baseUrl, baseUrl) ? config.apiKey : "";
 }
 
 function maskApiKey(key: string): string {
@@ -116,7 +125,9 @@ type AiTaskState = {
   pendingAutoRun: boolean;
   emptyRetries: number;
   requestRetries: number;
+  // The latest steps and the total run so far (see aiTask.ts).
   steps: AiTaskStep[];
+  stepCount: number;
   updatedAt: number;
 };
 const aiTasks = new Map<string, AiTaskState>();
@@ -126,6 +137,9 @@ const AI_MESSAGE_MAX_CHARS = 120_000;
 // Task ids with a runAiTask call in progress. Set before the first await so two
 // concurrent calls can never both restore and run the same queued command.
 const aiTasksInFlight = new Set<string>();
+// In-flight tasks whose context was cleared meanwhile; their call must not write
+// the task back when it finishes. An id leaves the set when that call ends.
+const clearedAiTasks = new Set<string>();
 
 function pruneAiTasks(): void {
   const now = Date.now();
@@ -151,27 +165,58 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
   }
 }
 
-async function persistAiTaskState(db: Db, taskId: string, state: AiTaskState): Promise<void> {
+// A finished or failed task (ended) clears the task columns so no page can resume it.
+async function persistAiTaskState(db: Db, taskId: string, state: AiTaskState, ended: boolean): Promise<void> {
+  if (clearedAiTasks.has(taskId)) return;
   // pending_command is what the page shows behind 确认并执行; a command that will
   // run without confirmation must never appear there.
-  const pendingCommand = state.pendingAutoRun ? "" : state.pendingCommand;
+  const columns = ended
+    ? { taskId: null, pendingCommand: "", stateJson: null }
+    : { taskId, pendingCommand: state.pendingAutoRun ? "" : state.pendingCommand, stateJson: JSON.stringify(state) };
   await db.insert(schema.aiAgentContext).values({
     id: 1,
-    taskId,
     root: state.root,
     path: state.path,
-    pendingCommand,
-    messagesJson: "[]",
-    stateJson: JSON.stringify(state),
+    messagesJson: JSON.stringify({ version: 0, messages: [] }),
     updatedAt: new Date(),
-  }).onConflictDoUpdate({ target: schema.aiAgentContext.id, set: {
-    taskId,
-    root: state.root,
-    path: state.path,
-    pendingCommand,
-    stateJson: JSON.stringify(state),
-    updatedAt: new Date(),
-  } });
+    ...columns,
+  }).onConflictDoUpdate({ target: schema.aiAgentContext.id, set: { ...columns, updatedAt: new Date() } });
+}
+
+const AI_CONTEXT_STEP = z.object({ command: z.string(), stdout: z.string().max(AI_STEP_OUTPUT_MAX_CHARS), stderr: z.string().max(AI_STEP_OUTPUT_MAX_CHARS), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() });
+const AI_CONTEXT_MESSAGES = z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(20000), steps: z.array(AI_CONTEXT_STEP).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })).max(40);
+type AiContextMessages = z.infer<typeof AI_CONTEXT_MESSAGES>;
+// stepCount is how many steps the current task already has, so the page shows only
+// the steps that come after it.
+const aiContextSchema = z.object({ ok: z.boolean(), version: z.number().int(), taskId: z.string().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string(), pendingCommand: z.string(), stepCount: z.number().int(), messages: AI_CONTEXT_MESSAGES });
+type AiContext = z.infer<typeof aiContextSchema>;
+const EMPTY_AI_CONTEXT: AiContext = { ok: true, version: 0, taskId: null, root: "workspace", path: "", pendingCommand: "", stepCount: 0, messages: [] };
+
+// messages_json is { version, messages }; rows from before versioning hold a bare
+// array. Older rows may also hold step output past today's cap; clip it on read.
+function parseTranscript(json: string): { version: number; messages: AiContextMessages } {
+  const parsed = JSON.parse(json) as unknown;
+  const record = Array.isArray(parsed) ? { version: 0, messages: parsed } : parsed as { version?: unknown; messages?: unknown } | null;
+  const raw = Array.isArray(record?.messages) ? record.messages as Array<{ steps?: unknown }> : [];
+  const clipped = raw.map((message) => (message && Array.isArray(message.steps) ? { ...message, steps: (message.steps as Array<{ stdout?: unknown; stderr?: unknown }>).map((step) => (typeof step?.stdout === "string" && typeof step.stderr === "string" ? clipStep(step as { stdout: string; stderr: string }) : step)) } : message));
+  return { version: typeof record?.version === "number" ? record.version : 0, messages: AI_CONTEXT_MESSAGES.catch([]).parse(clipped) };
+}
+
+async function readAiContext(db: Db): Promise<AiContext> {
+  const [row] = await db.select().from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
+  if (!row) return EMPTY_AI_CONTEXT;
+  try {
+    const transcript = parseTranscript(row.messagesJson);
+    let state: Partial<AiTaskState> | null = null;
+    try { state = row.stateJson ? JSON.parse(row.stateJson) as Partial<AiTaskState> : null; } catch { /* restoreAiTask handles a bad state */ }
+    // Rows written before auto-run commands were kept out of pending_command may still hold one.
+    const pendingCommand = state?.pendingAutoRun ? "" : row.pendingCommand;
+    const stepCount = typeof state?.stepCount === "number" ? state.stepCount : Array.isArray(state?.steps) ? state.steps.length : 0;
+    return { ok: true, version: transcript.version, taskId: row.taskId, root: row.root as AiContext["root"], path: row.path, pendingCommand, stepCount: row.taskId ? stepCount : 0, messages: transcript.messages };
+  } catch {
+    await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
+    return EMPTY_AI_CONTEXT;
+  }
 }
 
 const AI_BASH_TOOL = { type: "function", function: { name: "bash", description: "Run one bash command in the sandbox. Commands that write, modify, move or delete files or data pause for user confirmation and may be rejected; other commands run automatically. Set done=true with an empty command when the task is complete.", parameters: { type: "object", properties: { command: { type: "string", description: "The bash command to run; empty when the task is done." }, explanation: { type: "string", description: "Short explanation for this step." }, done: { type: "boolean", description: "Whether the task is complete." } }, required: ["command", "explanation", "done"], additionalProperties: false } } };
@@ -183,7 +228,7 @@ async function restoreAiTask(db: Db, taskId: string): Promise<AiTaskState | unde
     const restored = JSON.parse(row.stateJson) as AiTaskState;
     if (!Array.isArray(restored.messages) || !Array.isArray(restored.steps)) return undefined;
     // The token hash is not trusted across restarts; a fresh token is issued on demand.
-    const state: AiTaskState = { ...restored, pendingTokenHash: null, emptyRetries: restored.emptyRetries ?? 0, requestRetries: restored.requestRetries ?? 0, updatedAt: Date.now() };
+    const state: AiTaskState = { ...restored, pendingTokenHash: null, emptyRetries: restored.emptyRetries ?? 0, requestRetries: restored.requestRetries ?? 0, steps: restored.steps.slice(-AI_TASK_MAX_STEPS).map(clipStep), stepCount: restored.stepCount ?? restored.steps.length, updatedAt: Date.now() };
     aiTasks.set(taskId, state);
     return state;
   } catch {
@@ -245,9 +290,12 @@ async function requestNextAiCommand(config: typeof schema.aiProviderConfig.$infe
 export const Actions = {
   migratePrivateWorkspace: defineAction({
     request: z.object({}),
-    response: z.object({ ok: z.boolean(), message: z.string(), migrated: z.boolean(), path: z.string() }),
+    response: z.object({ ok: z.boolean(), message: z.string(), migrated: z.boolean(), done: z.boolean(), path: z.string() }),
     privileged: [privileged.materializePrivateWorkspace],
     async handler(ctx) {
+      const status = await ctx.executePrivileged(privileged.materializePrivateWorkspace, { entries: [], final: false });
+      // Done once (marker on disk): never read the legacy rows or blobs again.
+      if (!status.ok || status.done) return status;
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.workspaceItems);
       const byId = new Map(rows.map((row) => [row.id, row]));
@@ -265,21 +313,39 @@ export const Actions = {
         }
         return parts.join("/");
       };
-      const entries: Array<{ path: string; kind: "folder" | "file"; dataBase64: string | null }> = [];
+      const failed = (message: string) => ({ ok: false, message, migrated: false, done: false, path: status.path });
+      const items: Array<{ row: Row; path: string }> = [];
       for (const row of rows) {
         const path = pathFor(row);
-        if (!path) return { ok: false, message: "旧私有数据包含无效层级，迁移已停止且未删除旧数据。", migrated: false, path: "" };
+        if (!path) return failed("旧私有数据包含无效层级，迁移已停止且未删除旧数据。");
+        items.push({ row, path });
+      }
+      // Folders first, then files, sent in batches that stay under the contract
+      // limits. Files already on disk are skipped, so an interrupted run resumes.
+      items.sort((a, b) => Number(a.row.kind === "file") - Number(b.row.kind === "file"));
+      let batch: Array<{ path: string; kind: "folder" | "file"; dataBase64: string | null }> = [];
+      let batchChars = 0;
+      for (const { row, path } of items) {
         let dataBase64: string | null = null;
         if (row.kind === "file") {
-          if (!row.blobKey) return { ok: false, message: `旧文件“${row.name}”缺少内容，迁移已停止且未删除旧数据。`, migrated: false, path: "" };
+          if (!row.blobKey) return failed(`旧文件“${row.name}”缺少内容，迁移已停止且未删除旧数据。`);
           const url = await ctx.blobs.getUrl(row.blobKey, { expiresInSeconds: 120 });
           const response = await fetch(url);
-          if (!response.ok) return { ok: false, message: `旧文件“${row.name}”读取失败，迁移已停止且未删除旧数据。`, migrated: false, path: "" };
+          if (!response.ok) return failed(`旧文件“${row.name}”读取失败，迁移已停止且未删除旧数据。`);
           dataBase64 = encodeBase64(new Uint8Array(await response.arrayBuffer()));
+          if (dataBase64.length > PRIVATE_MIGRATION_BATCH_CHARS) return failed(`旧文件“${row.name}”超过 12 MB，无法迁移；旧数据仍保留。`);
         }
-        entries.push({ path, kind: row.kind, dataBase64 });
+        if (batch.length && (batch.length >= 1000 || batchChars + (dataBase64?.length ?? 0) > PRIVATE_MIGRATION_BATCH_CHARS)) {
+          const result = await ctx.executePrivileged(privileged.materializePrivateWorkspace, { entries: batch, final: false });
+          if (!result.ok) return result;
+          batch = [];
+          batchChars = 0;
+        }
+        batch.push({ path, kind: row.kind, dataBase64 });
+        batchChars += dataBase64?.length ?? 0;
       }
-      return ctx.executePrivileged(privileged.materializePrivateWorkspace, { entries });
+      const result = await ctx.executePrivileged(privileged.materializePrivateWorkspace, { entries: batch, final: true });
+      return result.ok ? { ...result, migrated: items.length > 0, message: items.length ? `已把 ${items.length} 个原有项目迁移到真实目录。` : result.message } : result;
     },
   }),
 
@@ -379,38 +445,38 @@ export const Actions = {
 
   getAiContext: defineAction({
     request: z.object({}),
-    response: z.object({ ok: z.boolean(), taskId: z.string().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string(), pendingCommand: z.string(), messages: z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })) }),
+    response: aiContextSchema,
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
       await ensureTables(db);
-      const [row] = await db.select().from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
-      if (!row) return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", messages: [] };
-      try {
-        const messages = JSON.parse(row.messagesJson) as unknown;
-        // Rows written before auto-run commands were kept out of pending_command may
-        // still hold one; the task state says whether it really waits for the user.
-        let autoRun = false;
-        try { autoRun = Boolean(row.stateJson && (JSON.parse(row.stateJson) as Partial<AiTaskState>).pendingAutoRun); } catch { /* restoreAiTask handles a bad state */ }
-        return { ok: true, taskId: row.taskId, root: row.root as "system" | "workspace" | "build" | "private", path: row.path, pendingCommand: autoRun ? "" : row.pendingCommand, messages: Array.isArray(messages) ? messages : [] };
-      } catch {
-        await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
-        return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", messages: [] };
-      }
+      return readAiContext(db);
     },
   }),
 
+  // The page owns only the chat transcript and the working location. Task id,
+  // pending command and task state belong to runAiTask; a page never writes them,
+  // so a stale page cannot resurrect a finished task or hide a pending command.
   saveAiContext: defineAction({
-    request: z.object({ taskId: z.string().uuid().nullable(), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), pendingCommand: z.string().max(4000), messages: z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(20000), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })).max(40) }),
-    response: z.object({ ok: z.boolean() }),
+    request: z.object({ version: z.number().int().min(0), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), messages: AI_CONTEXT_MESSAGES }),
+    response: z.object({ ok: z.boolean(), version: z.number().int(), context: aiContextSchema.nullable() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       await ensureTables(db);
-      if (!args.messages.length && !args.taskId && !args.pendingCommand) {
-        await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
-        return { ok: true };
+      const [row] = await db.select().from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
+      let current = 0;
+      try { current = row ? parseTranscript(row.messagesJson).version : 0; } catch { /* an unreadable transcript is replaced */ }
+      // Another page (another device) saved since this page last loaded: hand it the
+      // newer context instead of overwriting it.
+      if (args.version !== current) return { ok: false, version: current, context: await readAiContext(db) };
+      const version = current + 1;
+      const messagesJson = JSON.stringify({ version, messages: args.messages });
+      if (!row) {
+        if (!args.messages.length) return { ok: true, version: current, context: null };
+        await db.insert(schema.aiAgentContext).values({ id: 1, taskId: null, root: args.root, path: args.path, pendingCommand: "", messagesJson, updatedAt: new Date() }).onConflictDoNothing();
+      } else {
+        await db.update(schema.aiAgentContext).set({ root: args.root, path: args.path, messagesJson, updatedAt: new Date() }).where(eq(schema.aiAgentContext.id, 1));
       }
-      await db.insert(schema.aiAgentContext).values({ id: 1, taskId: args.taskId, root: args.root, path: args.path, pendingCommand: args.pendingCommand, messagesJson: JSON.stringify(args.messages), updatedAt: new Date() }).onConflictDoUpdate({ target: schema.aiAgentContext.id, set: { taskId: args.taskId, root: args.root, path: args.path, pendingCommand: args.pendingCommand, messagesJson: JSON.stringify(args.messages), updatedAt: new Date() } });
-      return { ok: true };
+      return { ok: true, version, context: null };
     },
   }),
 
@@ -422,6 +488,11 @@ export const Actions = {
       await ensureTables(db);
       const [row] = await db.select({ taskId: schema.aiAgentContext.taskId }).from(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1)).limit(1);
       if (row?.taskId) aiTasks.delete(row.taskId);
+      // There is one shared context, so every task still running belongs to it.
+      for (const taskId of aiTasksInFlight) {
+        clearedAiTasks.add(taskId);
+        aiTasks.delete(taskId);
+      }
       await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
       return { ok: true };
     },
@@ -437,8 +508,8 @@ export const Actions = {
       }
       const db = ctx.db<typeof schema>();
       // An empty key keeps the saved one, since the page never receives it.
-      const apiKey = args.apiKey.trim() || (await readAiConfig(db))?.apiKey || "";
-      if (!apiKey) return { ok: false, message: "请填写 API Key。" };
+      const apiKey = args.apiKey.trim() || savedKeyFor(await readAiConfig(db), baseUrl);
+      if (!apiKey) return { ok: false, message: "请填写 API Key（更换了 API 地址时需要重新填写）。" };
       const now = new Date();
       await db.insert(schema.aiProviderConfig).values({ id: 1, baseUrl, apiKey, model: args.model, updatedAt: now }).onConflictDoUpdate({ target: schema.aiProviderConfig.id, set: { baseUrl, apiKey, model: args.model, updatedAt: now } });
       return { ok: true, message: "AI 配置已保存到服务器。" };
@@ -456,8 +527,8 @@ export const Actions = {
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : "模型地址无效。", models: [] };
       }
-      const apiKey = args.apiKey.trim() || (await readAiConfig(ctx.db<typeof schema>()))?.apiKey || "";
-      if (!apiKey) return { ok: false, message: "请填写 API Key。", models: [] };
+      const apiKey = args.apiKey.trim() || savedKeyFor(await readAiConfig(ctx.db<typeof schema>()), baseUrl);
+      if (!apiKey) return { ok: false, message: "请填写 API Key（更换了 API 地址时需要重新填写）。", models: [] };
       const signal = AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS);
       try {
         const response = await fetch(`${baseUrl}/models`, { headers: { Authorization: `Bearer ${apiKey}` }, signal, redirect: "error" });
@@ -474,8 +545,10 @@ export const Actions = {
   }),
 
   runAiTask: defineAction({
-    request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().max(4000).default(""), reject: z.boolean().default(false), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), confirmToken: z.string().max(128).nullable().default(null) }),
-    response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(z.object({ command: z.string(), stdout: z.string(), stderr: z.string(), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() })), pendingCommand: z.string().nullable(), confirmToken: z.string().nullable(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable() }),
+    // knownSteps: how many of this task's steps the page already has; only later
+    // steps come back, and stepCount is the new total.
+    request: z.object({ taskId: z.string().uuid().nullable(), prompt: z.string().max(4000).default(""), reject: z.boolean().default(false), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), confirmToken: z.string().max(128).nullable().default(null), knownSteps: z.number().int().min(0).default(0) }),
+    response: z.object({ ok: z.boolean(), taskId: z.string(), status: z.enum(["running", "waiting_confirmation", "completed", "failed"]), message: z.string(), steps: z.array(AI_CONTEXT_STEP), stepCount: z.number().int(), pendingCommand: z.string().nullable(), confirmToken: z.string().nullable(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable() }),
     privileged: [privileged.executeShell],
     async handler(ctx, args) {
       // One call performs at most one model turn or one command. A multi-step
@@ -486,7 +559,7 @@ export const Actions = {
       const taskId = args.taskId ?? crypto.randomUUID();
       let state: AiTaskState | undefined = aiTasks.get(taskId);
       type Status = "running" | "waiting_confirmation" | "completed" | "failed";
-      const reply = (status: Status, message: string, extra: { pendingCommand?: string | null; confirmToken?: string | null; diagnostic?: AiDiagnostic | null; ok?: boolean } = {}) => ({ ok: extra.ok ?? status !== "failed", taskId, status, message, steps: state?.steps ?? [], pendingCommand: extra.pendingCommand ?? null, confirmToken: extra.confirmToken ?? null, diagnostic: extra.diagnostic ?? null });
+      const reply = (status: Status, message: string, extra: { pendingCommand?: string | null; confirmToken?: string | null; diagnostic?: AiDiagnostic | null; ok?: boolean } = {}) => ({ ok: extra.ok ?? status !== "failed", taskId, status, message, steps: state ? stepsSince(state, args.knownSteps) : [], stepCount: state?.stepCount ?? args.knownSteps, pendingCommand: extra.pendingCommand ?? null, confirmToken: extra.confirmToken ?? null, diagnostic: extra.diagnostic ?? null });
       if (aiTasksInFlight.has(taskId)) return reply("running", "任务正在执行，请等待当前步骤完成。", { ok: false, pendingCommand: state?.pendingCommand || null });
       aiTasksInFlight.add(taskId);
       const db = ctx.db<typeof schema>();
@@ -498,13 +571,14 @@ export const Actions = {
         if (!state) {
           if (args.taskId) return reply("failed", "任务不存在或已过期，请重新发起。");
           if (!prompt) return reply("failed", "请先描述要完成的任务。");
-          state = { root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, emptyRetries: 0, requestRetries: 0, steps: [], updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。会写入、修改、移动或删除文件和数据的命令会暂停等待用户确认，用户可能拒绝；其他命令自动执行。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
+          state = { root: args.root, path: args.path, cwd: null, runAsRoot: true, pendingCommand: "", pendingTokenHash: null, pendingAutoRun: false, emptyRetries: 0, requestRetries: 0, steps: [], stepCount: 0, updatedAt: Date.now(), messages: [{ role: "system", content: "你是一个沙盒终端 Agent，拥有 root 权限。每次只返回 JSON：{command:string, explanation:string, done:boolean}。一次只生成一条 bash 命令。会写入、修改、移动或删除文件和数据的命令会暂停等待用户确认，用户可能拒绝；其他命令自动执行。任务完成时 command 为空且 done=true。只输出 JSON，不要 Markdown。" }, { role: "user", content: `任务：${prompt}\n根类型：${args.root}\n相对路径：${args.path || "/"}` }] };
           aiTasks.set(taskId, state);
           pruneAiTasks();
         } else if (args.reject || prompt) {
-          // A rejection, or a message typed while a command waits, replaces the
-          // pending command with the user's feedback.
-          if (state.pendingCommand) {
+          // A rejection, or a message typed while a command waits for confirmation,
+          // replaces that command with the user's feedback. A queued auto-run command
+          // was never shown to the user, so it stays queued and is not "rejected".
+          if (state.pendingCommand && !state.pendingAutoRun) {
             pushAiMessage(state, { role: "user", content: `用户拒绝执行命令：${state.pendingCommand}${prompt ? "" : "\n请换一种不需要该操作的方式继续，或在无法继续时结束任务。"}` });
             state.pendingCommand = "";
             state.pendingTokenHash = null;
@@ -536,8 +610,8 @@ export const Actions = {
             pushAiMessage(task, { role: "user", content: isAutoRun ? `执行命令：${queuedCommand}` : `用户已确认执行待执行命令：${queuedCommand}` });
             const result = await ctx.executePrivileged(privileged.executeShell, { command: queuedCommand, root: task.root, path: task.path, cwd: task.cwd, runAsRoot: task.runAsRoot });
             task.cwd = result.cwd;
-            task.steps.push({ command: queuedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: !isAutoRun });
-            pushAiMessage(task, { role: "user", content: `命令：${queuedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${result.stdout.slice(0, 12000)}\nstderr：${result.stderr.slice(0, 12000)}` });
+            const step = recordStep(task, { command: queuedCommand, stdout: result.stdout, stderr: result.stderr, cwd: result.cwd, exitCode: result.exitCode, requiresConfirmation: !isAutoRun });
+            pushAiMessage(task, { role: "user", content: `命令：${queuedCommand}\n退出码：${result.exitCode ?? "未知"}\nstdout：${step.stdout}\nstderr：${step.stderr}` });
             if (result.exitCode !== 0) pushAiMessage(task, { role: "user", content: "这条命令执行失败。请分析终端错误，自动修正命令并继续任务，不要等待用户重复提交。" });
             return reply("running", "命令已执行，继续下一步。");
           }
@@ -560,6 +634,13 @@ export const Actions = {
           task.emptyRetries = 0;
           if (next.done && !next.command) { aiTasks.delete(taskId); return reply("completed", next.explanation || "任务已完成。"); }
           if (!next.command) throw new Error("模型没有返回可执行命令，且未标记任务完成。");
+          if (next.command.length > SHELL_COMMAND_MAX_CHARS) {
+            // The shell contract would reject it after the user confirmed it; ask for
+            // shorter commands instead of queueing one that can never run.
+            pushAiMessage(task, { role: "assistant", content: JSON.stringify({ command: `${next.command.slice(0, 200)}…`, explanation: next.explanation, done: false }) });
+            pushAiMessage(task, { role: "user", content: `上一条命令有 ${next.command.length} 个字符，超过单条命令 ${SHELL_COMMAND_MAX_CHARS} 字符的上限，没有执行。请拆成多条较短的命令，写大文件时分段追加写入。` });
+            return reply("running", `模型给出的命令超过 ${SHELL_COMMAND_MAX_CHARS} 字符，已要求拆分后重试。`);
+          }
           // done=true with a command: run the command first rather than dropping it.
           const assessment = assessCommand(next.command);
           pushAiMessage(task, { role: "assistant", content: JSON.stringify({ ...next, done: false }) });
@@ -578,16 +659,18 @@ export const Actions = {
           return reply("failed", `AI Agent 执行失败：${error instanceof Error ? error.message : "未知错误"}`, { diagnostic: describeAiError(error) });
         } finally {
           task.updatedAt = Date.now();
-          await persistAiTaskState(db, taskId, task);
+          await persistAiTaskState(db, taskId, task, !aiTasks.has(taskId));
         }
       } finally {
         aiTasksInFlight.delete(taskId);
+        // A call that restored or created the task after the clear must not leave it in memory either.
+        if (clearedAiTasks.delete(taskId)) aiTasks.delete(taskId);
       }
     },
   }),
 
   executeShell: defineAction({
-    request: z.object({ command: z.string().min(1).max(4000), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null) }),
+    request: z.object({ command: z.string().min(1).max(SHELL_COMMAND_MAX_CHARS), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null) }),
     response: z.object({ ok: z.boolean(), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), timedOut: z.boolean(), cwd: z.string(), durationMs: z.number().int() }),
     privileged: [privileged.executeShell],
     async handler(ctx, args) { return ctx.executePrivileged(privileged.executeShell, args); },

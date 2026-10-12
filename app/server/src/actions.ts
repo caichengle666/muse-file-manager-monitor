@@ -152,12 +152,15 @@ function pushAiMessage(state: AiTaskState, message: AiTaskMessage): void {
 }
 
 async function persistAiTaskState(db: Db, taskId: string, state: AiTaskState): Promise<void> {
+  // pending_command is what the page shows behind 确认并执行; a command that will
+  // run without confirmation must never appear there.
+  const pendingCommand = state.pendingAutoRun ? "" : state.pendingCommand;
   await db.insert(schema.aiAgentContext).values({
     id: 1,
     taskId,
     root: state.root,
     path: state.path,
-    pendingCommand: state.pendingCommand,
+    pendingCommand,
     messagesJson: "[]",
     stateJson: JSON.stringify(state),
     updatedAt: new Date(),
@@ -165,7 +168,7 @@ async function persistAiTaskState(db: Db, taskId: string, state: AiTaskState): P
     taskId,
     root: state.root,
     path: state.path,
-    pendingCommand: state.pendingCommand,
+    pendingCommand,
     stateJson: JSON.stringify(state),
     updatedAt: new Date(),
   } });
@@ -384,7 +387,11 @@ export const Actions = {
       if (!row) return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", messages: [] };
       try {
         const messages = JSON.parse(row.messagesJson) as unknown;
-        return { ok: true, taskId: row.taskId, root: row.root as "system" | "workspace" | "build" | "private", path: row.path, pendingCommand: row.pendingCommand, messages: Array.isArray(messages) ? messages : [] };
+        // Rows written before auto-run commands were kept out of pending_command may
+        // still hold one; the task state says whether it really waits for the user.
+        let autoRun = false;
+        try { autoRun = Boolean(row.stateJson && (JSON.parse(row.stateJson) as Partial<AiTaskState>).pendingAutoRun); } catch { /* restoreAiTask handles a bad state */ }
+        return { ok: true, taskId: row.taskId, root: row.root as "system" | "workspace" | "build" | "private", path: row.path, pendingCommand: autoRun ? "" : row.pendingCommand, messages: Array.isArray(messages) ? messages : [] };
       } catch {
         await db.delete(schema.aiAgentContext).where(eq(schema.aiAgentContext.id, 1));
         return { ok: true, taskId: null, root: "workspace" as const, path: "", pendingCommand: "", messages: [] };

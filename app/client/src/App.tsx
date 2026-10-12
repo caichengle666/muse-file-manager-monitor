@@ -123,6 +123,17 @@ function formatLocalDateTime(iso: string): string {
 }
 
 const SHELL_TIMEOUT_SECONDS = SHELL_TIMEOUT_MS / 1000;
+// One runAiTask call is one model turn (server AI_AGENT_REQUEST_TIMEOUT_MS, 100 s) or
+// one command (25 s); past this the request is treated as lost so the panel never
+// stays busy forever. aiSecurity.ts pulls in node modules, so it is not imported here.
+const AI_CALL_TIMEOUT_MS = 130_000;
+const AI_BUSY_RETRY_MS = 2_000;
+const sleep = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`请求超过 ${ms / 1000} 秒没有响应，点「继续」重试`)), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 const CORE_COLORS = ["var(--accent)", "var(--amber)", "#2f7da5", "#b44d80"];
 
 function ActionButton({ children, onClick, disabled, tone = "neutral", ariaLabel }: { children: ReactNode; onClick?: () => void; disabled?: boolean; tone?: "neutral" | "accent" | "danger"; ariaLabel?: string }) {
@@ -407,11 +418,12 @@ export function App() {
               onDownload={downloadHostFile} onSensitiveChange={setShowSensitive} onDialog={setHostDialog}
             />
           </section>
-        ) : tab === "terminal" ? (
-          <TerminalView entries={terminalHistory} busy={terminalBusy} onRun={runTerminal} onClear={() => { setTerminalHistory([]); agentMirrorRef.current = 0; }} onAgentSteps={mirrorAgentSteps} />
-        ) : (
+        ) : tab === "monitor" ? (
           <MonitorView snapshot={snapshot} history={history} loading={monitorQuery.isPending} error={monitorQuery.isError} onRefresh={() => void monitorQuery.refetch()} directoryUsage={directoryUsage} scanBusy={directoryScanBusy} scanProgress={directoryScanProgress} onScan={() => void scanHomeUsage()} />
-        )}
+        ) : null}
+        {/* Kept mounted on every tab: an AI task loop must survive a tab switch, or the
+            remounted panel loses track of the running task and its busy state. */}
+        <TerminalView hidden={tab !== "terminal"} entries={terminalHistory} busy={terminalBusy} onRun={runTerminal} onClear={() => { setTerminalHistory([]); agentMirrorRef.current = 0; }} onAgentSteps={mirrorAgentSteps} />
         </main>
       </div>
 
@@ -487,7 +499,7 @@ function HostFilesView({ query, root, path, busy, showSensitive, uploadRef, onUp
   </div>;
 }
 
-function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries: TerminalEntry[]; busy: boolean; onRun: (command: string, root: HostRoot, path: string) => Promise<void>; onClear: () => void; onAgentSteps: (steps: AgentStep[]) => void }) {
+function TerminalView({ hidden, entries, busy, onRun, onClear, onAgentSteps }: { hidden: boolean; entries: TerminalEntry[]; busy: boolean; onRun: (command: string, root: HostRoot, path: string) => Promise<void>; onClear: () => void; onAgentSteps: (steps: AgentStep[]) => void }) {
   const [command, setCommand] = useState("");
   const [root, setRoot] = useState<HostRoot>("workspace");
   const [path, setPath] = useState("");
@@ -553,15 +565,17 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
       agentStepCountRef.current = 0;
     } finally { setAiBusy(false); }
   }
-  async function runAgent(options: { confirmToken?: string; reject?: boolean } = {}) {
+  async function runAgent(options: { confirmToken?: string; reject?: boolean; resume?: boolean } = {}) {
     if (aiBusy) return;
     const confirming = Boolean(options.confirmToken);
-    const task = confirming ? "" : agentPrompt.trim();
+    // resume continues the task without taking whatever is typed in the input.
+    const keepPrompt = confirming || Boolean(options.resume);
+    const task = keepPrompt ? "" : agentPrompt.trim();
     if (!task && !agentTaskId) return;
     setAgentExpanded(true);
     if (task) appendAgentMessage({ role: "user", text: task });
     if (options.reject) appendAgentMessage({ role: "assistant", text: `已拒绝执行：${agentPending}` });
-    if (!confirming) setAgentPrompt("");
+    if (!keepPrompt) setAgentPrompt("");
     setAiBusy(true);
     let activeTaskId = agentTaskId;
     let request = { prompt: task, reject: Boolean(options.reject), confirmToken: options.confirmToken ?? null };
@@ -571,8 +585,11 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
       // gateway never sees a multi-minute request. Keep driving the loop here until
       // the task finishes or needs user confirmation.
       for (let round = 0; round < maxRounds; round += 1) {
-        const result = await api.runAiTask({ taskId: activeTaskId, root, path, ...request });
+        const result = await withTimeout(api.runAiTask({ taskId: activeTaskId, root, path, ...request }), AI_CALL_TIMEOUT_MS);
         request = { prompt: "", reject: false, confirmToken: null };
+        // Another call still holds this task (an earlier page, another device);
+        // wait for it instead of spinning through every round.
+        if (!result.ok && result.status === "running") await sleep(AI_BUSY_RETRY_MS);
         const newSteps = result.steps.slice(agentStepCountRef.current);
         agentStepCountRef.current = result.steps.length;
         activeTaskId = result.status === "completed" || result.status === "failed" ? null : result.taskId;
@@ -595,7 +612,22 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
     if (!token) {
       // After a reload the page has the pending command but no token; ask the
       // server for a fresh one, and only use it if the command is unchanged.
-      const result = await api.runAiTask({ taskId: agentTaskId, root, path, prompt: "", reject: false, confirmToken: null });
+      let result: Awaited<ReturnType<typeof api.runAiTask>>;
+      setAiBusy(true);
+      try {
+        result = await withTimeout(api.runAiTask({ taskId: agentTaskId, root, path, prompt: "", reject: false, confirmToken: null }), AI_CALL_TIMEOUT_MS);
+      } catch (error) {
+        appendAgentMessage({ role: "assistant", text: `请求失败：${error instanceof Error ? error.message : "未知错误"}` });
+        return;
+      } finally { setAiBusy(false); }
+      if (result.status === "running") {
+        // The command did not need confirmation, so the server ran it (or another
+        // call is running the task); keep driving the task from here.
+        setAgentPending("");
+        setAgentToken(null);
+        await runAgent({ resume: true });
+        return;
+      }
       if (result.status !== "waiting_confirmation" || !result.confirmToken || result.pendingCommand !== agentPending) {
         setAgentPending(result.status === "waiting_confirmation" ? result.pendingCommand ?? "" : "");
         setAgentToken(result.confirmToken ?? null);
@@ -607,7 +639,7 @@ function TerminalView({ entries, busy, onRun, onClear, onAgentSteps }: { entries
     }
     await runAgent({ confirmToken: token });
   }
-  return <section className={`terminal-panel ${agentExpanded ? "ai-open" : "ai-closed"}`} aria-label="终端">
+  return <section hidden={hidden} className={`terminal-panel ${agentExpanded ? "ai-open" : "ai-closed"}`} aria-label="终端">
     <div className="terminal-toolbar"><div><strong>Shell</strong><small>每条命令最多运行 {SHELL_TIMEOUT_SECONDS} 秒</small></div><button onClick={onClear} disabled={!entries.length}>清空输出</button></div>
     <div className={`terminal-location ${locationOpen ? "is-open" : "is-collapsed"}`}><button type="button" className="terminal-location-toggle" onClick={() => setLocationOpen((open) => !open)} aria-expanded={locationOpen}>执行位置 <span>{root === "workspace" ? "工作区" : root} · {path || "根目录"}</span><b>{locationOpen ? "收起" : "展开"}</b></button><div className="terminal-location-fields"><label>工作目录<select value={root} onChange={(event) => setRoot(event.target.value as HostRoot)}><option value="workspace">工作区</option><option value="system">系统根目录</option><option value="build">构件目录</option></select></label><label>相对路径<input value={path} onChange={(event) => setPath(event.target.value)} placeholder="留空表示根目录" /></label></div></div>
     <div id="ai-agent-panel" className="ai-terminal-panel">

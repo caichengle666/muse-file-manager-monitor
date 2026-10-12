@@ -141,6 +141,7 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .terminal-panel { position: relative; flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(96px, 22vh) minmax(0, 1fr) auto; grid-template-areas: "toolbar" "location" "output" "ai" "command"; border: 1px solid #34413c; border-radius: 10px; overflow: hidden; box-shadow: 0 16px 34px rgba(0,0,0,.12); }
 .terminal-panel.ai-closed { grid-template-rows: auto auto minmax(0, 1fr) auto auto; grid-template-areas: "toolbar" "location" "output" "command" "ai-bar"; }
 .ai-closed .ai-terminal-panel { display: none; }
+.terminal-panel[hidden] { display: none; }
 .terminal-toolbar { grid-area: toolbar; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 14px; color: #dce8df; background: #121917; border-bottom: 1px solid #34413c; }
 .terminal-toolbar > div { display: grid; gap: 3px; }
 .terminal-toolbar strong { font: 700 16px/1.2 "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }

@@ -60,3 +60,16 @@ function clipOutput(text: string): string {
 export function clipStep<T extends { stdout: string; stderr: string }>(step: T): T {
   return step.stdout.length <= AI_STEP_OUTPUT_MAX_CHARS && step.stderr.length <= AI_STEP_OUTPUT_MAX_CHARS ? step : { ...step, stdout: clipOutput(step.stdout), stderr: clipOutput(step.stderr) };
 }
+
+// One saved chat message (the transcript the page keeps). A model's explanation can
+// be any length; clipping it keeps one long reply from failing every later save.
+export const AI_CONTEXT_TEXT_MAX_CHARS = 20_000;
+const CLIPPED_TEXT = "\n…（内容过长，已截断）";
+export function clipMessageText(text: string): string {
+  if (text.length <= AI_CONTEXT_TEXT_MAX_CHARS) return text;
+  let end = AI_CONTEXT_TEXT_MAX_CHARS - CLIPPED_TEXT.length;
+  // Never cut a surrogate pair in half.
+  const code = text.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+  return text.slice(0, end) + CLIPPED_TEXT;
+}

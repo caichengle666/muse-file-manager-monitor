@@ -4,7 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import { assessCommand } from "./commandPolicy";
 import * as schema from "./schema";
-import { AI_STEP_OUTPUT_MAX_CHARS, SHELL_COMMAND_MAX_CHARS, clipStep } from "./shellExecution";
+import { AI_CONTEXT_TEXT_MAX_CHARS, AI_STEP_OUTPUT_MAX_CHARS, SHELL_COMMAND_MAX_CHARS, clipMessageText, clipStep } from "./shellExecution";
 import { AI_TASK_MAX_STEPS, recordStep, stepsSince } from "./aiTask";
 
 type Db = SpaceDb<typeof schema>;
@@ -21,6 +21,8 @@ let tablesPromise: Promise<void> | null = null;
 // was restored without migration state. Runs once per process.
 function ensureTables(db: Db): Promise<void> {
   tablesPromise ??= (async () => {
+    await db.run(sql`CREATE TABLE IF NOT EXISTS workspace_items (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER, name TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('folder', 'file')), blob_key TEXT, mime_type TEXT, size INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    await db.run(sql`CREATE INDEX IF NOT EXISTS workspace_items_parent_idx ON workspace_items(parent_id)`);
     await db.run(sql`CREATE TABLE IF NOT EXISTS service_restart_record (id integer PRIMARY KEY NOT NULL, restart_count integer NOT NULL DEFAULT 0, previous_started_at integer, current_started_at integer NOT NULL, instance_id text NOT NULL, updated_at integer NOT NULL)`);
     await db.run(sql`CREATE TABLE IF NOT EXISTS ai_provider_config (id integer PRIMARY KEY NOT NULL, base_url text NOT NULL, api_key text NOT NULL, model text NOT NULL, updated_at integer NOT NULL)`);
     await db.run(sql`CREATE TABLE IF NOT EXISTS ai_agent_context (id integer PRIMARY KEY NOT NULL, task_id text, root text NOT NULL, path text NOT NULL, pending_command text NOT NULL DEFAULT '', confirm_token text, messages_json text NOT NULL, state_json text, updated_at integer NOT NULL)`);
@@ -184,7 +186,7 @@ async function persistAiTaskState(db: Db, taskId: string, state: AiTaskState, en
 }
 
 const AI_CONTEXT_STEP = z.object({ command: z.string(), stdout: z.string().max(AI_STEP_OUTPUT_MAX_CHARS), stderr: z.string().max(AI_STEP_OUTPUT_MAX_CHARS), cwd: z.string(), exitCode: z.number().int().nullable(), requiresConfirmation: z.boolean() });
-const AI_CONTEXT_MESSAGES = z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(20000), steps: z.array(AI_CONTEXT_STEP).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })).max(40);
+const AI_CONTEXT_MESSAGES = z.array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().max(AI_CONTEXT_TEXT_MAX_CHARS), steps: z.array(AI_CONTEXT_STEP).optional(), diagnostic: z.object({ phase: z.string(), url: z.string(), status: z.number().int().nullable(), model: z.string(), detail: z.string(), responseSnippet: z.string(), contentSnippet: z.string() }).nullable().optional() })).max(40);
 type AiContextMessages = z.infer<typeof AI_CONTEXT_MESSAGES>;
 // stepCount is how many steps the current task already has, so the page shows only
 // the steps that come after it.
@@ -198,7 +200,9 @@ function parseTranscript(json: string): { version: number; messages: AiContextMe
   const parsed = JSON.parse(json) as unknown;
   const record = Array.isArray(parsed) ? { version: 0, messages: parsed } : parsed as { version?: unknown; messages?: unknown } | null;
   const raw = Array.isArray(record?.messages) ? record.messages as Array<{ steps?: unknown }> : [];
-  const clipped = raw.map((message) => (message && Array.isArray(message.steps) ? { ...message, steps: (message.steps as Array<{ stdout?: unknown; stderr?: unknown }>).map((step) => (typeof step?.stdout === "string" && typeof step.stderr === "string" ? clipStep(step as { stdout: string; stderr: string }) : step)) } : message));
+  // An over-long message (saved before messages were clipped) is clipped too, so it
+  // cannot make the whole transcript fail validation.
+  const clipped = raw.map((item) => (item && typeof (item as { text?: unknown }).text === "string" ? { ...item, text: clipMessageText((item as { text: string }).text) } : item)).map((message) => (message && Array.isArray(message.steps) ? { ...message, steps: (message.steps as Array<{ stdout?: unknown; stderr?: unknown }>).map((step) => (typeof step?.stdout === "string" && typeof step.stderr === "string" ? clipStep(step as { stdout: string; stderr: string }) : step)) } : message));
   return { version: typeof record?.version === "number" ? record.version : 0, messages: AI_CONTEXT_MESSAGES.catch([]).parse(clipped) };
 }
 
@@ -291,12 +295,13 @@ export const Actions = {
   migratePrivateWorkspace: defineAction({
     request: z.object({}),
     response: z.object({ ok: z.boolean(), message: z.string(), migrated: z.boolean(), done: z.boolean(), path: z.string() }),
-    privileged: [privileged.materializePrivateWorkspace],
+    privileged: [privileged.materializePrivateWorkspace, privileged.probePrivateMigration],
     async handler(ctx) {
       const status = await ctx.executePrivileged(privileged.materializePrivateWorkspace, { entries: [], final: false });
       // Done once (marker on disk): never read the legacy rows or blobs again.
       if (!status.ok || status.done) return status;
       const db = ctx.db<typeof schema>();
+      await ensureTables(db);
       const rows = await db.select().from(schema.workspaceItems);
       const byId = new Map(rows.map((row) => [row.id, row]));
       const pathFor = (row: Row): string | null => {
@@ -321,13 +326,24 @@ export const Actions = {
         items.push({ row, path });
       }
       // Folders first, then files, sent in batches that stay under the contract
-      // limits. Files already on disk are skipped, so an interrupted run resumes.
+      // limits. Files already on disk in full are neither downloaded nor sent again,
+      // so an interrupted run resumes where it stopped.
       items.sort((a, b) => Number(a.row.kind === "file") - Number(b.row.kind === "file"));
+      const filePaths = items.filter((item) => item.row.kind === "file").map((item) => item.path);
+      const onDisk = new Map<string, number>();
+      for (let index = 0; index < filePaths.length; index += 1000) {
+        const chunk = filePaths.slice(index, index + 1000);
+        const probe = await ctx.executePrivileged(privileged.probePrivateMigration, { paths: chunk });
+        if (!probe.ok) break;
+        chunk.forEach((path, offset) => onDisk.set(path, probe.sizes[offset] ?? -1));
+      }
       let batch: Array<{ path: string; kind: "folder" | "file"; dataBase64: string | null }> = [];
       let batchChars = 0;
       for (const { row, path } of items) {
         let dataBase64: string | null = null;
         if (row.kind === "file") {
+          const existingSize = onDisk.get(path) ?? -1;
+          if (existingSize >= 0 && existingSize >= row.size) continue;
           if (!row.blobKey) return failed(`旧文件“${row.name}”缺少内容，迁移已停止且未删除旧数据。`);
           const url = await ctx.blobs.getUrl(row.blobKey, { expiresInSeconds: 120 });
           const response = await fetch(url);

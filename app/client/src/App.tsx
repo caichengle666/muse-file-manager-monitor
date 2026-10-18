@@ -13,7 +13,7 @@ XAxis,
 YAxis,
 } from "recharts";
 import { api, type ApiResponse } from "./api";
-import { SHELL_TIMEOUT_MS, clipStep } from "../../server/src/shellExecution";
+import { SHELL_TIMEOUT_MS, clipMessageText, clipStep } from "../../server/src/shellExecution";
 
 type HostListing = ApiResponse<typeof api, "listHostDirectory">;
 type HostEntry = HostListing["entries"][number];
@@ -599,7 +599,9 @@ function TerminalView({ hidden, entries, busy, onRun, onClear, onAgentSteps }: {
       appendAgentMessage({ role: "assistant", text: `拉取模型失败：${error instanceof Error ? error.message : "未知错误"}` });
     } finally { setAiBusy(false); }
   }
-  function appendAgentMessage(message: AgentMessage) { setAgentMessages((current) => [...current, message].slice(-40)); }
+  // Clipped to the saved transcript's limit, so one very long model reply cannot
+  // make every later save fail validation.
+  function appendAgentMessage(message: AgentMessage) { const clipped = { ...message, text: clipMessageText(message.text) }; setAgentMessages((current) => [...current, clipped].slice(-40)); }
   async function clearAgentContext() {
     setAiBusy(true);
     try {
@@ -863,6 +865,17 @@ function ImageViewer({ viewer, busy, onClose, onNavigate, onDownload }: { viewer
 
   function clampZoom(value: number) { return Math.min(8, Math.max(0.15, Number(value.toFixed(2)))); }
   function changeZoom(delta: number) { setZoom((current) => clampZoom(current + delta)); }
+  // React registers wheel listeners as passive, where preventDefault() is ignored and
+  // the page scrolls behind the viewer; a native non-passive listener can stop it.
+  const stageRef = useRef<HTMLDivElement>(null);
+  const unavailableRef = useRef(false);
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const onWheel = (event: WheelEvent) => { event.preventDefault(); if (!unavailableRef.current) setZoom((current) => clampZoom(current + (event.deltaY > 0 ? -0.15 : 0.15))); };
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
+  }, []);
   function fitWindow() { setFit(true); setZoom(1); setPan({ x: 0, y: 0 }); }
   function actualSize() { setFit(false); setZoom(1); setPan({ x: 0, y: 0 }); }
   function pointerDistance() {
@@ -912,6 +925,7 @@ function ImageViewer({ viewer, busy, onClose, onNavigate, onDownload }: { viewer
   }
 
   const unavailable = !viewer.loading && (!viewer.dataUri || imageError);
+  unavailableRef.current = unavailable;
   return <div className="image-viewer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="image-viewer" role="dialog" aria-modal="true" aria-labelledby="image-viewer-title">
       <header className="image-viewer-head">
@@ -925,7 +939,7 @@ function ImageViewer({ viewer, busy, onClose, onNavigate, onDownload }: { viewer
           <button onClick={onClose} aria-label="关闭图片查看器"><Glyph name="close" /></button>
         </div>
       </header>
-      <div className="image-stage" onWheel={(event) => { if (unavailable) return; event.preventDefault(); changeZoom(event.deltaY > 0 ? -0.15 : 0.15); }} onPointerDown={onStagePointerDown} onPointerMove={onStagePointerMove} onPointerUp={onStagePointerEnd} onPointerCancel={onStagePointerEnd}>
+      <div className="image-stage" ref={stageRef} onPointerDown={onStagePointerDown} onPointerMove={onStagePointerMove} onPointerUp={onStagePointerEnd} onPointerCancel={onStagePointerEnd}>
         {previous && <button className="image-nav previous" onClick={(event) => { event.stopPropagation(); onNavigate(previous); }} aria-label={`上一张：${previous.name}`}><Glyph name="previous" size={26} /></button>}
         {next && <button className="image-nav next" onClick={(event) => { event.stopPropagation(); onNavigate(next); }} aria-label={`下一张：${next.name}`}><Glyph name="next" size={26} /></button>}
         {viewer.loading ? <div className="image-viewer-status" role="status"><div className="loader" /><strong>正在载入图片</strong></div> : unavailable ? <div className="image-viewer-status error" role="status"><Glyph name="file" size={42} /><strong>{viewer.tooLarge ? "文件过大，建议下载" : "图片无法显示"}</strong><p>{viewer.message || "图片可能已损坏或格式不受支持。"}</p><button onClick={() => onDownload(viewer.item)} disabled={busy}><Glyph name="download" />{busy ? "准备中…" : "下载文件"}</button></div> : <img src={viewer.dataUri ?? undefined} alt={`图片预览：${viewer.item.name}`} draggable={false} className={fit ? "fit" : "actual"} style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }} onLoad={(event) => setDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} onError={() => setImageError(true)} />}

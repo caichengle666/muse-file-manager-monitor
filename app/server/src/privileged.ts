@@ -19,12 +19,12 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { cpus, homedir, hostname, loadavg, platform, release, uptime, userInfo } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { definePrivilegedContracts, definePrivilegedHandlers, z } from "@hatch/space-sdk";
 import { SHELL_COMMAND_MAX_CHARS, SHELL_OUTPUT_MAX_CHARS, SHELL_TIMEOUT_MS, createOutputCollector, selectShellExecutionMode, shellSpawnArgs } from "./shellExecution";
-import { isUtf8Text, pathExists, selectListing, utf8SafeLength } from "./hostFiles";
+import { applyTextFormat, blockedNames, detectTextFormat, fsyncDirectory, hiddenBelowRoot, isUtf8Text, pathExists, selectListing, utf8SafeLength, writeFileDurably, writeMigratedFile } from "./hostFiles";
 
 export const privileged = definePrivilegedContracts({
   listHostDirectory: {
@@ -100,6 +100,13 @@ export const privileged = definePrivilegedContracts({
     response: z.object({ ok: z.boolean(), message: z.string(), migrated: z.boolean(), done: z.boolean(), path: z.string() }),
     timeoutMs: 15000,
   },
+  probePrivateMigration: {
+    // Size of each legacy file already on disk (-1 when missing), so a resumed
+    // migration downloads only what is still missing.
+    request: z.object({ paths: z.array(z.string().max(2000)).max(1000) }),
+    response: z.object({ ok: z.boolean(), sizes: z.array(z.number().int()) }),
+    timeoutMs: 15000,
+  },
   executeShell: {
     request: z.object({ command: z.string().min(1).max(SHELL_COMMAND_MAX_CHARS), root: z.enum(["system", "workspace", "build", "private"]), path: z.string().max(2000), cwd: z.string().max(2000).nullable().default(null), runAsRoot: z.boolean().default(false) }),
     response: z.object({ ok: z.boolean(), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), timedOut: z.boolean(), cwd: z.string(), durationMs: z.number().int() }),
@@ -146,7 +153,6 @@ function systemBootedAtMs(nowMs: number, uptimeSec: number): number {
   return cachedBootedAtMs;
 }
 
-const blockedNames = /^(\.env(?:\..*)?|credentials?(?:\..*)?|.*(?:secret|password|token|private|cookie|session|wallet|\.pem|\.key)$|id_rsa.*|\.ssh|\.aws|\.gnupg|\.netrc)$/i;
 
 function findRoot(kind: HostRoot): { path: string; label: string } | null {
   const cwd = process.cwd();
@@ -185,6 +191,11 @@ function safeRelative(raw: string, showSensitive: boolean): string | null {
 function inside(root: string, absolute: string): boolean {
   const relation = relative(root, absolute);
   return relation !== ".." && !relation.startsWith(`..${sep}`);
+}
+
+// Symlink targets get the same root-relative sensitive-name check as requested paths.
+function hiddenLinkTarget(root: string, resolved: string, showSensitive: boolean): boolean {
+  return !showSensitive && hiddenBelowRoot(root, resolved, blockedNames);
 }
 
 /**
@@ -382,10 +393,18 @@ function processSamples(): Map<number, ProcSample> {
       const close = raw.lastIndexOf(")"); const open = raw.indexOf("(");
       if (open < 0 || close < 0) continue;
       const rest = raw.slice(close + 2).trim().split(/\s+/);
-      result.set(Number(entry), { pid: Number(entry), name: raw.slice(open + 1, close), status: rest[0] ?? "?", ticks: Number(rest[11] ?? 0) + Number(rest[12] ?? 0), rss: Math.max(0, Number(rest[21] ?? 0) * 4096) });
+      result.set(Number(entry), { pid: Number(entry), name: raw.slice(open + 1, close), status: rest[0] ?? "?", ticks: Number(rest[11] ?? 0) + Number(rest[12] ?? 0), rss: Math.max(0, Number(rest[21] ?? 0) * pageSize()) });
     } catch { /* process exited */ }
   }
   return result;
+}
+let cachedPageSize = 0;
+// RSS in /proc/<pid>/stat is in pages; arm64 kernels may use 16K or 64K pages.
+function pageSize(): number {
+  if (!cachedPageSize) {
+    try { cachedPageSize = Number(execFileSync("getconf", ["PAGESIZE"], { encoding: "utf8", timeout: 2000 }).trim()) || 4096; } catch { cachedPageSize = 4096; }
+  }
+  return cachedPageSize;
 }
 function sleep(ms: number): Promise<void> { return new Promise((resolvePromise) => setTimeout(resolvePromise, ms)); }
 function directorySize(path: string): Promise<{ size: number; timedOut: boolean }> {
@@ -448,7 +467,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         if (!entry.isSymbolicLink()) return entry.isFile() ? 1 : 2;
         try {
           const resolved = realpathSync(join(target.absolute, entry.name));
-          if (!args.showSensitive && resolved.split("/").filter(Boolean).some((part) => blockedNames.test(part))) return 2;
+          if (hiddenLinkTarget(selectedRoot.path, resolved, args.showSensitive)) return 2;
           const targetStats = statSync(resolved);
           return targetStats.isDirectory() ? 0 : targetStats.isFile() ? 1 : 2;
         } catch { return 2; }
@@ -464,8 +483,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
           if (entry.isSymbolicLink()) {
             try {
               const resolved = realpathSync(lexical);
-              const resolvedParts = resolved.split("/").filter(Boolean);
-              if (!args.showSensitive && resolvedParts.some((part) => blockedNames.test(part))) targetKind = "other";
+              if (hiddenLinkTarget(selectedRoot.path, resolved, args.showSensitive)) targetKind = "other";
               else {
                 const targetStats = statSync(resolved);
                 targetKind = targetStats.isDirectory() ? "folder" : targetStats.isFile() ? "file" : "other";
@@ -501,7 +519,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
             if (entry.isSymbolicLink()) {
               try {
                 const resolved = realpathSync(lexical);
-                if (!args.showSensitive && resolved.split("/").filter(Boolean).some((part) => blockedNames.test(part))) return [];
+                if (hiddenLinkTarget(directory.root.path, resolved, args.showSensitive)) return [];
                 const targetStats = statSync(resolved);
                 targetKind = targetStats.isFile() ? "file" : targetStats.isDirectory() ? "folder" : "other";
                 if (targetKind !== "file") return [];
@@ -599,27 +617,31 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       assertSafeMutationTarget(target.absolute);
       const first = readSlice(target.absolute, 0, Math.min(64_000, Math.max(1, stats.size)));
       if (!isLikelyText(first, target.absolute)) return { ok: false, message: "二进制文件只能查看十六进制或下载，不能按文本保存。" };
-      if (stats.size > 8_000_000 || !isUtf8Text(readFileSync(target.absolute))) return { ok: false, message: "文件不是 UTF-8 编码（或过大），按文本保存会损坏原内容，未作任何更改。" };
+      const original = stats.size > 8_000_000 ? null : readFileSync(target.absolute);
+      if (!original || !isUtf8Text(original)) return { ok: false, message: "文件不是 UTF-8 编码（或过大），按文本保存会损坏原内容，未作任何更改。" };
       if (!canWrite(target.absolute)) return { ok: false, message: "当前运行用户没有这个文件的写入权限。" };
       const parentDirectory = assertSafeParent(target.absolute);
       if (!canWrite(parentDirectory)) return { ok: false, message: "为保护原文件，保存需要其所在目录可写；当前目录只读，未作任何更改。" };
+      // Keep the file's own line breaks and UTF-8 BOM (see detectTextFormat).
+      const content = applyTextFormat(args.content, detectTextFormat(original));
       const uid = process.getuid?.();
       // Replacing via rename would split a hard link, or hand a file owned by
       // someone else to the worker (only root can chown it back); write in place.
       const inPlace = stats.nlink > 1 ? "文件有多个硬链接，已原地保存以保留链接。" : uid !== undefined && uid !== 0 && stats.uid !== uid ? "文件属于其他用户，已原地保存以保留所有者。" : "";
       if (inPlace) {
-        writeFileSync(target.absolute, args.content, "utf8");
+        writeFileDurably(target.absolute, content, "w");
         return { ok: true, message: inPlace };
       }
       // A fixed-length name: the original name plus a suffix can pass the 255-byte limit.
       temporaryPath = join(parentDirectory, `.muse-${crypto.randomUUID()}.tmp`);
-      writeFileSync(temporaryPath, args.content, { encoding: "utf8", flag: "wx" });
+      writeFileDurably(temporaryPath, content, "wx");
       if (uid === 0) chownSync(temporaryPath, stats.uid, stats.gid);
       // After chown, which clears setuid/setgid; the umask must not narrow the mode
       // either. Best effort: some filesystems do not support chmod.
       try { chmodSync(temporaryPath, stats.mode & 0o7777); } catch { /* keep the default mode */ }
       renameSync(temporaryPath, target.absolute);
       temporaryPath = "";
+      fsyncDirectory(parentDirectory);
       return { ok: true, message: "文件已原子保存，原内容已安全替换。" };
     } catch {
       if (temporaryPath) try { unlinkSync(temporaryPath); } catch { /* temporary file may not exist */ }
@@ -716,7 +738,9 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       const folders = args.entries.filter((entry) => entry.kind === "folder").sort((a, b) => a.path.split("/").length - b.path.split("/").length);
       const files = args.entries.filter((entry) => entry.kind === "file");
       for (const entry of [...folders, ...files]) {
-        const target = resolveInside(root.path, entry.path, false);
+        // Legacy names are the user's own data: the sensitive-name filter (a display
+        // filter) must not stop them from migrating; only "." and ".." are refused.
+        const target = resolveInside(root.path, entry.path, true);
         if (!target || !target.relativePath) throw new Error("invalid migration path");
         if (entry.kind === "folder") {
           if (existsSync(target.absolute) && !statSync(target.absolute).isDirectory()) throw new Error("folder conflict");
@@ -724,10 +748,12 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
           continue;
         }
         mkdirSync(dirname(target.absolute), { recursive: true });
-        // An earlier, interrupted run may already have written it.
-        if (existsSync(target.absolute)) continue;
-        if (entry.dataBase64 === null) throw new Error("missing file data");
-        writeFileSync(target.absolute, Buffer.from(entry.dataBase64, "base64"), { flag: "wx" });
+        if (entry.dataBase64 === null) {
+          // An earlier, interrupted run may already have written it.
+          if (existsSync(target.absolute)) continue;
+          throw new Error("missing file data");
+        }
+        writeMigratedFile(target.absolute, Buffer.from(entry.dataBase64, "base64"));
       }
       if (!args.final) return { ok: true, message: "迁移进行中。", migrated: false, done: false, path: root.path };
       writeFileSync(marker, `${new Date().toISOString()}\n`, { encoding: "utf8", flag: "wx" });
@@ -735,6 +761,17 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     } catch {
       return { ok: false, message: "原有私有数据迁移未完成；旧数据仍保留，下次打开私有目录时会继续。", migrated: false, done: false, path: root.path };
     }
+  },
+
+  async probePrivateMigration(args) {
+    const root = findRoot("private");
+    if (!root) return { ok: false, sizes: [] };
+    const sizes = args.paths.map((path) => {
+      const target = resolveInside(root.path, path, true);
+      if (!target || !target.relativePath) return -1;
+      try { const stats = lstatSync(target.absolute); return stats.isFile() ? stats.size : -1; } catch { return -1; }
+    });
+    return { ok: true, sizes };
   },
 
   async executeShell(args) {
